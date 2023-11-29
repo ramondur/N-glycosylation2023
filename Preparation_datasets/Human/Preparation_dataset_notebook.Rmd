@@ -1,0 +1,460 @@
+---
+title: "Preparation human dataset for PTM project"
+output: html_notebook
+---
+```{r, include=FALSE} 
+library(dplyr)
+library(ggplot2)
+library(rlist)
+library(tidyr)
+library(ggpubr)
+library(stringr)
+library(seqinr)
+library(IRanges)
+library(GenomicRanges)
+library(data.table)
+library(bio3d)
+```
+
+The human proteome was obtained from UniProtKB/Swiss-Prot database (reference proteome UP000005640; release 2022_02). Aggregation prone regions (APRs) were predicted computationally using TANGO at physiological conditions (pH at 7.5, temperature at 298 K, protein concentration at 1 mM and ionic strength at 0.15 M). 
+
+```{r, include=FALSE}
+tango_APRs <- read.delim("Data/Human/TANGO_output/PSX_tangoresidue.out", header=TRUE) #Read TANGO output
+colnames(tango_APRs) <- c("Protein","Position","Residue","tango_Score","length")
+tango_APRs$length <- NULL
+list_names <- strsplit(as.character(tango_APRs$Protein), "\\|")
+res <- matrix(nrow = length(tango_APRs$Protein), ncol = 1)
+for (i in 1:length(tango_APRs$Protein)){
+  res[i,] <- list_names[[i]][2]
+}
+tango_APRs$Protein <- res
+```
+
+The dataset contains 19379 proteins, after excluding sequences with nonstandard amino acids (e.g. selenocysteine), sequences with <25 amino acids and those with >10,000 residues and after filtering at 90% sequence identity using the CD-hit algorithm.
+
+```{r, include=FALSE}
+#cd-hit using the web server with default options
+names90 <- read.delim("Data/Human/UniProt/human_90.fasta", header=FALSE) #Read CD-hit output
+list_names <- strsplit(as.character(names90$V1), "\\|")
+res <- matrix(nrow = length(names90$V1), ncol = 1)
+for (i in 1:length(names90$V1)){
+  res[i,] <- list_names[[i]][2]
+}
+names90$V1 <- res
+names90 <- unique(names90)
+tango_APRs <- subset(tango_APRs, Protein %in% names90$V1) 
+#Remove proteins with less than 25 aa and more that 10,000 aa and define APRs score >10
+tango_APRs$length <- 1
+proteinsum <- aggregate(length ~ Protein, data=tango_APRs, FUN="sum") 
+colnames(proteinsum) <- c("Protein","protein_length")
+tango_APRs <- merge(tango_APRs,proteinsum, by="Protein")
+length(which(proteinsum$protein_length < 25))
+shorties <- tango_APRs[tango_APRs$Protein %in% proteinsum$Protein[proteinsum$protein_length<25],]
+master_df <- tango_APRs[!(tango_APRs$Protein %in% shorties$Protein),]
+```
+
+Signal peptides and transmembrane domains were identified using deepTMHMM. These were later removed from the analyses to avoid biases.
+
+```{r, include=FALSE}
+#First save human proteome file
+human_proteome <- aggregate (Residue ~ Protein, data=master_df, FUN="paste",collapse = "")
+colnames(human_proteome) <- c("Protein","Sequence")
+save(human_proteome, file = "Data/RData/Human/human_proteome.RData")
+#Create files for SignalP and TMHMM
+write.fasta(as.list(human_proteome$Sequence[1:5000]), human_proteome$Protein[1:5000], "Data/Human/UniProt/1-5000.fa", open = "w", nbchar = 60, as.string = FALSE)
+write.fasta(as.list(human_proteome$Sequence[5001:10000]), human_proteome$Protein[5001:10000], "Data/Human/UniProt/5001-10000.fa", open = "w", nbchar = 60, as.string = FALSE)
+write.fasta(as.list(human_proteome$Sequence[10001:15000]), human_proteome$Protein[10001:15000], "Data/Human/UniProt/10001-15000.fa", open = "w", nbchar = 60, as.string = FALSE)
+write.fasta(as.list(human_proteome$Sequence[15001:nrow(human_proteome)]), human_proteome$Protein[15001:nrow(human_proteome)], "Data/Human/UniProt/15001-end.fa", open = "w", nbchar = 60, as.string = FALSE)
+#Transmembrane domains from TMHMM (deepTMHMM using biolib webserver)
+trans1.5000 <- read.table("Data/Human/TMHMM/TMRs_1-5000.gff3", sep=";", quote="\"")
+trans5001.10000 <- read.table("Data/Human/TMHMM/TMRs_5001-10000.gff3", sep=";", quote="\"")
+trans10001.15000 <- read.table("Data/Human/TMHMM/TMRs_10001-15000.gff3", sep=";", quote="\"")
+transend <- read.table("Data/Human/TMHMM/TMRs_15001-end.gff3", sep=";", quote="\"")
+TMHMM <- rbind(trans1.5000,trans5001.10000,trans10001.15000,transend)
+TMHMM <- subset(TMHMM, V1 != "//")
+TMHMM <- cbind(TMHMM, read.table(text = TMHMM$V1, header = FALSE, sep = "\t"))
+TMHMM <- subset(TMHMM, select = c(2:5))
+colnames(TMHMM) <- c("Protein","Topology","Start","End")
+TMHMM <- subset(TMHMM, Protein %in% human_proteome$Protein)
+dt1 <- as.data.table(TMHMM)
+dt2 <- as.data.table(master_df)
+gr1 = GRanges(Rle(dt1$Protein), IRanges(as.numeric(dt1$Start), as.numeric(dt1$End)))
+gr2 = GRanges(Rle(dt2$Protein), IRanges(as.numeric(dt2$Position),as.numeric(dt2$Position)))
+zone.ind <- findOverlaps(gr2, gr1, select="arbitrary")
+dt2$Topology <- dt1$Topology[zone.ind]
+master_df <- as.data.frame(dt2)
+rm(dt2,dt1)
+gc()
+save(master_df, file = "Data/RData/Human/all_tango_res_filtered.RData")
+```
+
+In this study, APRs are defined as continuous segments between 5 and 15 amino acids in length, each with an aggregation score of at least 10. Gatekeeper positions (GKPs) are defined as the next three residues immediately downstream and upstream of APRs. All other residues are defined as distal regions. 
+
+```{r, include=FALSE}
+#Annotate TANGO categories and add avgTANGO per APR and maxTANGO protein
+load("Data/RData/Human/all_tango_res_filtered.RData")
+master_df$APRdef_tango <- "No"
+master_df$APRdef_tango[which(master_df$tango_Score > 10)] <- "APR" 
+annotateDF <- function(prepare_annotation, a,b,c,d) {
+  prepare_annotation$APRdef2_tango <- gsub(a, b, prepare_annotation$APRdef2_tango)
+  prepare_annotation$APRdef2_tango <- gsub(c, d, prepare_annotation$APRdef2_tango)
+  return(prepare_annotation)
+}
+master_df3 <- master_df
+master_df3$APRdef2_tango <-as.numeric(as.factor(master_df3$APRdef_tango))
+master_df3$APRdef2_tango[which(master_df3$APRdef2_tango == 2)] <- 0
+prepare_annotation <- aggregate (APRdef2_tango ~ Protein, data=master_df3, FUN="paste",collapse = "")
+prepare_annotation2 <- annotateDF(prepare_annotation,"01","21","10","12") #GK_1
+prepare_annotation2 <- annotateDF(prepare_annotation2,"02","32","20","23") #GK_2
+prepare_annotation2 <- annotateDF(prepare_annotation2,"03","43","30","34") #GK_3
+prepare_annotation2 <- annotateDF(prepare_annotation2,"04","54","40","45") #GK_4
+prepare_annotation2 <- annotateDF(prepare_annotation2,"05","65","50","56") #GK_5
+prepare_annotation2 <- annotateDF(prepare_annotation2,"06","76","60","67") #GK_6
+prepare_annotation2 <- annotateDF(prepare_annotation2,"07","87","70","78") #GK_7
+prepare_annotation2 <- annotateDF(prepare_annotation2,"08","98","80","89") #GK_8
+prepare_annotation2 <- annotateDF(prepare_annotation2,"09","!9","90","9!") #GK_9
+prepare_annotation2 <- annotateDF(prepare_annotation2,"0!","@!","!0","!@") #GK_10
+prepare_annotation2 <- paste(prepare_annotation2$APRdef2_tango, collapse="")
+prepare_annotation2 <- unlist(strsplit(prepare_annotation2,""))
+master_df3$APRdef2_tango <- prepare_annotation2
+master_df3$APRdef_tango[which(master_df3$APRdef2_tango == "0")] <- "Distal region"
+master_df3$APRdef_tango[which(master_df3$APRdef2_tango == "2")] <- "GK_1"
+master_df3$APRdef_tango[which(master_df3$APRdef2_tango == "3")] <- "GK_2"
+master_df3$APRdef_tango[which(master_df3$APRdef2_tango == "4")] <- "GK_3"
+master_df3$APRdef_tango[which(master_df3$APRdef2_tango %in% c("5","6","7","8","9","!","@"))] <- "FR"
+master_df3$Protein <- as.factor(master_df3$Protein)
+prepare_annotation3 <- annotateDF(prepare_annotation,"01","A1","10","1K") #GK_1
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0A","BA","K0","KL") #GK_2
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0B","CB","L0","LM") #GK_3
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0C","DC","M0","MN") #GK_4
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0D","ED","N0","NO") #GK_5
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0E","FE","O0","OP") #GK_6
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0F","GF","P0","PQ") #GK_7
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0G","HG","Q0","QR") #GK_8
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0H","IH","R0","RS") #GK_9
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0I","JI","S0","ST") #GK_10
+prepare_annotation3 <- paste(prepare_annotation3$APRdef2_tango, collapse="")
+prepare_annotation3 <- unlist(strsplit(prepare_annotation3,""))
+master_df3$Side <- prepare_annotation3
+master_df3$Side[which(master_df3$Side %in% c("0","1"))] <- "None"
+master_df3$Side[which(master_df3$Side %in% c("A","B","C","D","E","F","G","H","I","J"))] <- "N_ter"
+master_df3$Side[which(master_df3$Side %in% c("K","L","M","N","O","P","Q","R","S","T"))] <- "C_ter"
+#Define TANGO APRs ids
+tango_APRs <- subset(master_df3, APRdef_tango != "Distal region")
+j <- 1
+tango_APRs$APRcount_tango <- 0
+tango_APRs$APRcount_tango[1] <- 1
+for (i in 2:length(tango_APRs$Protein)){
+  if (i %% 10000 == 0){
+    print(i)
+  }
+  if (tango_APRs$Protein[i] != tango_APRs$Protein[i-1] | tango_APRs$Position[i] != (tango_APRs$Position[i-1]+1)){
+    j <- j + 1
+    tango_APRs$APRcount_tango[i] <- j 
+  }
+  else if (tango_APRs$Side[i-1] == "C_ter" & tango_APRs$APRdef2_tango[i-1] == "@") {
+    j <- j + 1
+    tango_APRs$APRcount_tango[i] <- j 
+  }
+  else if (tango_APRs$Side[i-1] == "C_ter" & tango_APRs$APRdef2_tango[i-1] != "@" & tango_APRs$Side[i] != "C_ter") {
+    j <- j + 1
+    tango_APRs$APRcount_tango[i] <- j 
+  }
+  else{
+    tango_APRs$APRcount_tango[i] <- j 
+  }
+}
+tango_APRs2 <- subset(tango_APRs, select = c(1,2,11))
+master_df3 <- merge(master_df3,tango_APRs2, by=c("Protein","Position"),all = TRUE)
+master_df3$APRcount_tango[which(is.na(master_df3$APRcount_tango))] <- 0
+master_df3$APRdef_tango[which(master_df3$APRcount_tango == 0)] <- "No"
+save(master_df3, file = "Data/RData/Human/all_tango_res_annotated.RData")
+#Summarize TANGO information
+load("Data/RData/Human/all_tango_res_annotated.RData")
+onlyapr_tango <- subset(master_df3, master_df3$APRdef_tango=="APR")
+tango_APRs <- aggregate (Residue ~ APRcount_tango, data=onlyapr_tango, FUN="paste",collapse = "")
+colnames(tango_APRs) <- c("APRcount_tango","APR")
+TotalTANGO <- aggregate (tango_Score ~ APRcount_tango, data=onlyapr_tango, FUN="sum")
+colnames(TotalTANGO) <- c("APRcount_tango","TotalTANGO")
+lengthAPR <- aggregate (length ~ APRcount_tango, data=onlyapr_tango, FUN="sum")
+colnames(lengthAPR) <- c("APRcount_tango","lengthAPR")
+startAPR <- aggregate (Position ~ APRcount_tango, data=onlyapr_tango, FUN="min")
+colnames(startAPR) <- c("APRcount_tango","startAPR")
+endAPR <- aggregate (Position ~ APRcount_tango, data=onlyapr_tango, FUN="max")
+colnames(endAPR) <- c("APRcount_tango","endAPR")
+proteins_apr <- unique(subset(onlyapr_tango, select = c(1,11)))
+topology_apr <- aggregate (Topology ~ APRcount_tango, data=onlyapr_tango, FUN="unique")
+tango_APRs <- Reduce(function(x, y) merge(x, y, all=TRUE), list(proteins_apr,tango_APRs,TotalTANGO,lengthAPR,startAPR,endAPR,topology_apr))
+tango_APRs$avgTANGO <- tango_APRs$TotalTANGO / tango_APRs$lengthAPR
+tango_APRs2 <- subset(tango_APRs, lengthAPR > 4 & lengthAPR < 16 & Topology %in% c("outside","inside")) #From 117144 to 85126
+onlyapr_tango <- onlyapr_tango[which(onlyapr_tango$APRcount_tango %in% tango_APRs2$APRcount_tango),]
+len_APR <- aggregate (length ~ APRcount_tango, data=onlyapr_tango, FUN="sum")
+colnames(len_APR)[2] <- "APR_length"
+onlyapr_tango$length <- NULL
+onlyapr_tango <- merge(onlyapr_tango,len_APR)
+master_df3$APRcount_tango[which(!master_df3$APRcount_tango %in% onlyapr_tango$APRcount_tango)] <- 0
+master_df3$APRdef_tango[which(master_df3$APRcount_tango == 0)] <- "Distal region"
+master_df3$APRdef2_tango[which(master_df3$APRcount_tango == 0)] <- 0
+master_df3$Side[which(master_df3$APRcount_tango == 0)] <- "None"
+total_scoreAPR <- aggregate (tango_Score ~ APRcount_tango, data=onlyapr_tango, sum)
+colnames(total_scoreAPR) <- c("APRcount_tango","TotalScore")
+onlyapr_tango <- merge(onlyapr_tango,total_scoreAPR,by="APRcount_tango")
+onlyapr_tango$avgScore <- onlyapr_tango$TotalScore / onlyapr_tango$APR_length
+maxAPR_Protein <- aggregate (avgScore ~ Protein, data=onlyapr_tango, max)
+colnames(maxAPR_Protein) <- c("Protein","maxProtscore")
+onlyapr_tango <- merge(onlyapr_tango,maxAPR_Protein,by="Protein")
+temp <- unique(subset(onlyapr_tango, select = c(1,2,11,13)))
+temp2 <- unique(subset(onlyapr_tango, select = c(1,14)))
+master_df3 <- merge(master_df3,temp,by = c("Protein","APRcount_tango"), all.x = TRUE)
+master_df3 <- merge(master_df3,temp2,by = c("Protein"), all.x = TRUE)
+master_df3 <- master_df3[order(master_df3$Protein, master_df3$Position),]
+rownames(master_df3) <- NULL
+master_df3$maxProtscore[which(is.na(master_df3$maxProtscore))] <- 0
+master_df3$avgScore[which(is.na(master_df3$avgScore))] <- 0
+master_df3$APR_length[which(is.na(master_df3$APR_length))] <- 0
+save(master_df3, file = "Data/RData/Human/master_df.RData")
+save(tango_APRs, file = "Data/RData/Human/tango_APRs_ALL.RData")
+save(tango_APRs2, file = "Data/RData/Human/tango_APRs.RData")
+```
+
+Since TANGO calculations of the aggregation propensity incorporate the effects of GKs, we also included a second step in the calculation, in which we recalculate the TANGO score of the isolated APRs flanked by Alanines. We called the resulting aggregation propensity score of APRs without the mitigating effect of the flanking GKs the “PureTANGO” score.
+
+```{r, include=FALSE}
+load("Data/RData/Human/master_df.RData")
+pure_tango <- subset(master_df3, master_df3$APRdef_tango=="APR")
+pure_tango <- aggregate (Residue ~ APRcount_tango, data=pure_tango, FUN="paste",collapse = "")
+pure_tango$Residue <- paste0("A",pure_tango$Residue)
+pure_tango$Residue <- paste0(pure_tango$Residue,"A")
+write.fasta(as.list(pure_tango$Residue), pure_tango$APRcount_tango, "Data/Human/TANGO_output/Pure_tango/pure_tango.fa", open = "w", nbchar = 60, as.string = FALSE)
+pure_tango <- read.delim("Data/Human/TANGO_output/Pure_tango/PSX_globaltotal.out", header=FALSE)
+pure_tango <- subset(pure_tango, select = c(1,3))
+colnames(pure_tango) <- c("APRcount_tango","pure_Tango")
+master_df3 <- merge(master_df3,pure_tango,all.x = TRUE)
+master_df3$pure_Tango <- master_df3$pure_Tango / master_df3$APR_length
+master_df3$pure_Tango[which(is.na(master_df3$pure_Tango))] <- 0
+master_df3 <- master_df3[order(master_df3$Protein, master_df3$Position),]
+rownames(master_df3) <- NULL
+save(master_df3, file = "Data/RData/Human/master_df.RData")
+```
+
+Information on protein subcellular location was extracted from UniProt.
+
+```{r, include=FALSE}
+uniprot.proteome <- read.delim("Data/Human/UniProt/human_proteome_info.tsv")
+uniprot.proteome <- subset(uniprot.proteome, select = c(1,8))
+colnames(uniprot.proteome) <- c("Protein","Sub_loc")
+master_df3 <- merge(master_df3,uniprot.proteome, all.x = TRUE)
+master_df3$Nucleus <- "No"
+master_df3$Nucleus[which(grepl("ucleus", master_df3$Sub_loc, fixed = TRUE))] <- "Yes"
+master_df3$Cytoplasm <- "No"
+master_df3$Cytoplasm[which(grepl("ytoplasm", master_df3$Sub_loc, fixed = TRUE))] <- "Yes"
+master_df3$Secreted <- "No"
+master_df3$Secreted[which(grepl("ecreted", master_df3$Sub_loc, fixed = TRUE))] <- "Yes"
+master_df3$Membrane <- "No"
+master_df3$Membrane[which(grepl("ell membrane", master_df3$Sub_loc, fixed = TRUE))] <- "Yes"
+master_df3$Mitochondrion <- "No"
+master_df3$Mitochondrion[which(grepl("itochondrion", master_df3$Sub_loc, fixed = TRUE))] <- "Yes"
+master_df3$Endoplasmic_reticulum <- "No"
+master_df3$Endoplasmic_reticulum[which(grepl("eticulum", master_df3$Sub_loc, fixed = TRUE))] <- "Yes"
+master_df3$Golgi <- "No"
+master_df3$Golgi[which(grepl("olgi", master_df3$Sub_loc, fixed = TRUE))] <- "Yes"
+master_df3$Lysosome <- "No"
+master_df3$Lysosome[which(grepl("ysosome", master_df3$Sub_loc, fixed = TRUE))] <- "Yes"
+save(master_df3, file = "Data/RData/Human/master_df.RData")
+```
+
+Structural information was added to the dataset for each protein from the AlphaFold structural database using DSSP.
+
+```{r echo=FALSE, message=FALSE, include=FALSE}
+# CODE MAPS:
+code3 <- c("ALA", "ARG", "ASN", "ASP", "CYS", "GLU", "GLN", "GLY", "HIS", 
+           "ILE", "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", 
+           "TYR", "VAL","H1S","H2S","TPO","PTR","SEP","HYP")
+code1 <- c("A", "R", "N", "D", "C", "E", "Q", "G", "H", "I", "L", "K", 
+           "M", "F", "P", "S", "T", "W", "Y", "V","H","H","T","Y","S","P")
+#Load
+load("Data/RData/Human/master_df.RData")
+load("Data/RData/Human/human_proteome.RData")
+master_struc <- master_df3
+master_struc$PDB <- NA
+master_struc$Acc <- NA
+master_struc$Secundary_Struc <- NA
+master_struc$X <- NA
+master_struc$Y <- NA
+master_struc$Z <- NA
+master_struc$ALPHA_SCORE <- NA
+#Alphafold structures path
+path_alpha <- "Data/Human/OriginalPDBs/"
+files_alpha <- list.files(path = path_alpha, full.names = FALSE)
+list_names <- strsplit(files_alpha, "-")
+res <- matrix(nrow = length(files_alpha), ncol = 1)
+res2 <- matrix(nrow = length(files_alpha), ncol = 1)
+for (i in 1:length(files_alpha)){
+  res[i,] <- list_names[[i]][2]
+  res2[i,] <- list_names[[i]][3]
+}
+proteins_alpha <- res
+names_alpha <- paste0(res, "-", res2)
+proteins_alpha <- data.frame(proteins_alpha,names_alpha,files_alpha)
+colnames(proteins_alpha) <- c("Protein","Name","Repair_pdb_path")
+proteins_alpha_p <- subset(proteins_alpha, Protein %in% human_proteome$Protein) #21970 out of 23391
+proteins_without_structure <- NA
+for (i in 1:nrow(proteins_alpha_p)){
+  #Create dataframe with all new structural info. Get PDBs info
+  print(i)
+  temp_name <- proteins_alpha_p$Name[i]
+  or_file <- paste0("Data/Human/OriginalPDBs/AF-",temp_name,'-model_v1.pdb')
+  temp_pdb_original <- read.delim(or_file, header=FALSE)
+  temp_pdb_original <- temp_pdb_original[grep("DBREF", temp_pdb_original$V1), ]
+  list_names <- strsplit(temp_pdb_original, " ")[[1]]
+  list_names <- list_names[which(list_names != '')]
+  prot_start <- list_names[9]
+  prot_end <- list_names[10]
+  temp_prot <- subset(master_struc, Protein == proteins_alpha_p$Protein[i] & Position >= as.integer(prot_start) & Position <= as.integer(prot_end))
+  file = paste0(path_alpha,proteins_alpha_p$Repair_pdb_path[i])
+  temp_pdb_repair <- read.pdb(file, maxlines = -1, multi = FALSE, rm.insert = FALSE,
+                              rm.alt = TRUE, ATOM.only = FALSE, hex = FALSE, verbose = TRUE)
+  temp_pdb_repair <- temp_pdb_repair$atom
+  temp_pdb_repair <- subset(temp_pdb_repair, elety == "CA", select = c(5,6,7,9,10,11,13))
+  for (k in 1:length(code3)){
+    temp_pdb_repair$resid <- gsub(code3[k],code1[k],temp_pdb_repair$resid,ignore.case=TRUE)
+  }
+  if (nrow(temp_prot) != nrow(temp_pdb_repair)){
+    proteins_without_structure <- c(proteins_without_structure,temp_name)
+    next
+  }
+  #Run DSSP
+  arg1 <- "-i"
+  pdb <- file
+  cmd <- paste("/Users/u0125634/Documents/PhD/Software/DSSP/xssp-3.0.10/mkdssp", arg1, pdb)
+  temp_co <- system(cmd, intern = TRUE)
+  temp_co <- temp_co[(length(temp_co) - nrow(temp_prot) + 1):length(temp_co)]
+  sec_structure <- substr(temp_co, 17, 17)
+  acc <- as.numeric(gsub(" ", "", substr(temp_co, 36, 38), fixed = TRUE))
+  #Merge everything
+  #!! If for some residue we have more than one structure, use the one with biggest AlphaFold score
+  if (sum(!is.na(temp_prot$PDB)) == 0) {
+    temp_prot$PDB<- temp_name
+    temp_prot$Acc <- acc
+    temp_prot$Secundary_Struc <- sec_structure
+    temp_prot$X <- temp_pdb_repair$x
+    temp_prot$Y <- temp_pdb_repair$y
+    temp_prot$Z <- temp_pdb_repair$z
+    temp_prot$ALPHA_SCORE <- temp_pdb_repair$b
+  } else {
+    for (j in 1:nrow(temp_pdb_repair)){
+      if (is.na(temp_prot$PDB[j]) | temp_prot$ALPHA_SCORE[j] < temp_pdb_repair$b[j]) {
+        temp_prot$PDB[j]<- temp_name
+        temp_prot$Acc[j] <- acc[j]
+        temp_prot$Secundary_Struc[j] <- sec_structure[j]
+        temp_prot$X[j] <- temp_pdb_repair$x[j]
+        temp_prot$Y[j] <- temp_pdb_repair$y[j]
+        temp_prot$Z[j] <- temp_pdb_repair$z[j]
+        temp_prot$ALPHA_SCORE[j] <- temp_pdb_repair$b[j]
+      }
+    }
+  }
+  master_struc[which(master_struc$Protein == proteins_alpha_p$Protein[i] & master_struc$Position >= as.integer(prot_start) & master_struc$Position <= as.integer(prot_end)),] <- temp_prot
+  rm(temp_prot)
+  rm(temp_pdb_repair)
+  gc()
+}
+save(master_struc, file = "Data/RData/Human/master_struc_alphafold_dssp.RData")
+proteins_without_structure <- as.character(unique(master_struc$Protein[which(is.na(master_struc$Acc))]))
+master_struc2 <- subset(master_struc,! Protein %in% proteins_without_structure) #146 proteins without a structure
+#Relative solvent accessibility
+MAX_RSA <- read.delim("Data/Other/MAX_RSA.txt", header=FALSE)
+colnames(MAX_RSA) <- c("Residue","Max_acc")
+master_struc2 <- merge(master_struc2, MAX_RSA, by = "Residue")
+master_struc2$Rel_acc <- master_struc2$Acc / master_struc2$Max_acc
+master_struc2$Rel_acc[which(master_struc2$Rel_acc > 1)] <- 1
+master_struc2 <- master_struc2[order(master_struc2$Protein, master_struc2$Position),]
+save(master_struc2, file = "Data/RData/Human/master_struc2_alphafold_dssp.RData")
+alpha_information_all <- subset(master_struc2, select = c(2,1,4,24:32))
+save(alpha_information_all, file = "Data/RData/Human/alpha_information_all_dssp.RData")
+```
+
+Calculate distance of each residue to closest APR.
+
+```{r, include=FALSE}
+#3D structures distance
+pdb_struc <- unique(master_struc2$PDB)
+master_struc2$dist <- NA
+for (i in 1:length(pdb_struc)){
+  print(i)
+  temp_pdb <- subset(master_struc2, PDB == pdb_struc[i])
+  temp_aprs <- unique(temp_pdb$APRcount_tango[which(temp_pdb$APRcount_tango != 0)])
+  distance.matrix_ALL <- NULL
+  if (length(temp_aprs) == 0){
+    next
+  }
+  for (a in temp_aprs){
+    distance.matrix <- as.matrix(dist(temp_pdb[,27:29], method = "euclidean"))
+    temp_res <- which(temp_pdb$APRcount_tango == a & temp_pdb$APRdef_tango == "APR")
+    if (length(temp_res) < 2){
+      next
+    }
+    distance.matrix<- distance.matrix[temp_res,]
+    min_temp <- apply(distance.matrix,2,min)
+    distance.matrix_ALL <- rbind(distance.matrix_ALL, min_temp)
+  }
+  if (length(temp_res) < 2){
+    next
+  }
+  min_ALL <- apply(distance.matrix_ALL,2,min)
+  master_struc2$dist[which(master_struc2$PDB == pdb_struc[i])] <- min_ALL
+}
+save(master_struc2, file = "Data/RData/Human/master_struc2_alphafold_dssp.RData")
+```
+
+Add secondary structure to APRs
+
+```{r, include=FALSE}
+aprs <- subset(master_struc2, APRdef_tango == "APR")
+Mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+aprs_sec <- aggregate(Secundary_Struc ~ APRcount_tango, data=aprs, FUN=Mode)
+colnames(aprs_sec)[2] <- "Sec_APR"
+master_struc2 <- merge(master_struc2, aprs_sec, by = "APRcount_tango", all.x = TRUE)
+master_struc2 <- master_struc2[order(master_struc2$Protein, master_struc2$Position),]
+rownames(master_struc2) <- NULL
+master_struc3 <- subset(master_struc2, select = c(3,2,4,7,8,1,5,9:24,26:30,32,33,34))
+save(master_struc3, file = "Data/RData/Human/master_struc2_alphafold_dssp.RData")
+```
+
+Finally add FoldX information (burial and energies). Structures were previously repaired with the FoldX RepairPDB command.
+
+```{r, include=FALSE}
+load("Data/RData/Human/master_struc2_alphafold_dssp.RData")
+master_struc3$MainChain.burial <- NA
+master_struc3$SideChain.burial <- NA
+master_struc3$Energy <- NA
+
+#FoldX sequence detail path
+proteins_detail <- unique(master_struc3$PDB) #21862
+for (i in 916:length(proteins_detail)){
+  print(i)
+  temp_name <- proteins_detail[i]
+  or_file <- paste0("Data/Human/OriginalPDBs/AF-",temp_name,'-model_v1.pdb')
+  temp_pdb_original <- read.delim(or_file, header=FALSE)
+  temp_pdb_original <- temp_pdb_original[grep("DBREF", temp_pdb_original$V1), ]
+  list_names <- strsplit(temp_pdb_original, " ")[[1]]
+  list_names <- list_names[which(list_names != '')]
+  temp_pos <- c(list_names[9]:list_names[10])
+  detail_file <- paste0("Data/Human/SequenceDetails/SD_AF-",temp_name,'-model_v1_Repair.fxout')
+  sequence_detail <- read.delim(detail_file, header=FALSE)
+  sequence_detail$V4 <- temp_pos
+  temp_prot <- subset(master_struc3, PDB == temp_name)
+  sequence_detail <- subset(sequence_detail,V4 %in% temp_prot$Position)
+  temp_prot$MainChain.burial <- sequence_detail$V34
+  temp_prot$SideChain.burial <- sequence_detail$V33
+  temp_prot$Energy <- sequence_detail$V9
+  master_struc3[which(master_struc3$PDB == temp_name),] <- temp_prot
+  rm(temp_prot)
+  gc()
+}
+save(master_struc3, file = "Data/RData/Human/master_struc2_alphafold_dssp.RData")
+```
+

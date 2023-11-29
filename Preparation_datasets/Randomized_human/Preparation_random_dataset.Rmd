@@ -1,0 +1,210 @@
+---
+title: "Preparation random human dataset for PTM project"
+output: html_notebook
+---
+```{r, include=FALSE} 
+library(dplyr)
+library(ggplot2)
+library(rlist)
+library(tidyr)
+library(ggpubr)
+library(stringr)
+library(seqinr)
+library(IRanges)
+library(GenomicRanges)
+library(data.table)
+library(bio3d)
+```
+
+
+```{r, include=FALSE}
+tango_APRs_extra <- read.delim("Data/Human/TANGO_output/Random_extra/PSX_tangoresidue.out", header=TRUE)
+tango_APRs_intra <- read.delim("Data/Human/TANGO_output/Random_intra/PSX_tangoresidue.out", header=TRUE)
+tango_APRs_extra$type <- "Extra"
+tango_APRs_intra$type <- "Intra"
+tango_APRs <- rbind(tango_APRs_extra,tango_APRs_intra)
+colnames(tango_APRs) <- c("Protein","Position","Residue","tango_Score","length","type")
+tango_APRs$length <- NULL
+tango_APRs$Protein <- paste0(tango_APRs$Protein,"_",tango_APRs$type)
+```
+
+
+```{r, include=FALSE}
+#cd-hit using the web server with default options
+names90_extra <- read.delim("Data/Human/Random/random_extra90.fasta", header=FALSE)
+names90_intra <- read.delim("Data/Human/Random/random_intra90.fasta", header=FALSE)
+names90_extra$type <- "Extra"
+names90_intra$type <- "Intra"
+names90 <- rbind(names90_extra,names90_intra)
+names90 <- subset(names90, substring(V1,1,1) == ">")
+names90 <- unique(names90)
+names90$V1 <- substring(names90$V1, 2)
+tango_APRs <- subset(tango_APRs, Protein %in% paste0(names90$V1,"_",names90$type)) 
+#Remove proteins with less than 25 aa and more that 10,000 aa
+tango_APRs$length <- 1
+proteinsum <- aggregate(length ~ Protein, data=tango_APRs, FUN="sum") 
+colnames(proteinsum) <- c("Protein","protein_length")
+tango_APRs <- merge(tango_APRs,proteinsum, by="Protein")
+length(which(proteinsum$protein_length < 25))
+shorties <- tango_APRs[tango_APRs$Protein %in% proteinsum$Protein[proteinsum$protein_length<25],]
+master_df <- tango_APRs[!(tango_APRs$Protein %in% shorties$Protein),]
+```
+
+
+```{r, include=FALSE}
+#First save random proteome file
+random_proteome <- aggregate (Residue ~ Protein, data=master_df, FUN="paste",collapse = "")
+colnames(random_proteome) <- c("Protein","Sequence")
+save(random_proteome, file = "Data/RData/Random/random_proteome.RData")
+#Transmembrane domains from TMHMM (deepTMHMM using biolib webserver)
+trans_extra <- read.table("Data/Human/Random/TMRs_random_extra.gff3", sep=";", quote="\"")
+trans_intra <- read.table("Data/Human/Random/TMRs_random_intra.gff3", sep=";", quote="\"")
+trans_extra$type <- "Extra"
+trans_intra$type <- "Intra"
+TMHMM <- rbind(trans_extra,trans_intra)
+TMHMM <- subset(TMHMM, V1 != "//")
+TMHMM <- cbind(TMHMM, read.table(text = TMHMM$V1, header = FALSE, sep = "\t"))
+TMHMM <- subset(TMHMM, select = c(3:6,2))
+colnames(tango_APRs) <- c("Protein","Topology","Start","End","type")
+TMHMM$Protein <- paste0(TMHMM$Protein,"_",TMHMM$type)
+TMHMM <- subset(TMHMM, Protein %in% random_proteome$Protein)
+dt1 <- as.data.table(TMHMM)
+dt2 <- as.data.table(master_df)
+gr1 = GRanges(Rle(dt1$Protein), IRanges(as.numeric(dt1$Start), as.numeric(dt1$End)))
+gr2 = GRanges(Rle(dt2$Protein), IRanges(as.numeric(dt2$Position),as.numeric(dt2$Position)))
+zone.ind <- findOverlaps(gr2, gr1, select="arbitrary")
+dt2$Topology <- dt1$Topology[zone.ind]
+master_df <- as.data.frame(dt2)
+rm(dt2,dt1)
+gc()
+save(master_df, file = "Data/RData/Random/all_tango_res_filtered.RData")
+```
+
+
+```{r, include=FALSE}
+#Annotate TANGO categories and add avgTANGO per APR and maxTANGO protein
+load("Data/RData/Random/all_tango_res_filtered.RData")
+master_df$APRdef_tango <- "No"
+master_df$APRdef_tango[which(master_df$tango_Score > 10)] <- "APR" 
+annotateDF <- function(prepare_annotation, a,b,c,d) {
+  prepare_annotation$APRdef2_tango <- gsub(a, b, prepare_annotation$APRdef2_tango)
+  prepare_annotation$APRdef2_tango <- gsub(c, d, prepare_annotation$APRdef2_tango)
+  return(prepare_annotation)
+}
+master_df3 <- master_df
+master_df3$APRdef2_tango <-as.numeric(as.factor(master_df3$APRdef_tango))
+master_df3$APRdef2_tango[which(master_df3$APRdef2_tango == 2)] <- 0
+prepare_annotation <- aggregate (APRdef2_tango ~ Protein, data=master_df3, FUN="paste",collapse = "")
+prepare_annotation2 <- annotateDF(prepare_annotation,"01","21","10","12") #GK_1
+prepare_annotation2 <- annotateDF(prepare_annotation2,"02","32","20","23") #GK_2
+prepare_annotation2 <- annotateDF(prepare_annotation2,"03","43","30","34") #GK_3
+prepare_annotation2 <- annotateDF(prepare_annotation2,"04","54","40","45") #GK_4
+prepare_annotation2 <- annotateDF(prepare_annotation2,"05","65","50","56") #GK_5
+prepare_annotation2 <- annotateDF(prepare_annotation2,"06","76","60","67") #GK_6
+prepare_annotation2 <- annotateDF(prepare_annotation2,"07","87","70","78") #GK_7
+prepare_annotation2 <- annotateDF(prepare_annotation2,"08","98","80","89") #GK_8
+prepare_annotation2 <- annotateDF(prepare_annotation2,"09","!9","90","9!") #GK_9
+prepare_annotation2 <- annotateDF(prepare_annotation2,"0!","@!","!0","!@") #GK_10
+prepare_annotation2 <- paste(prepare_annotation2$APRdef2_tango, collapse="")
+prepare_annotation2 <- unlist(strsplit(prepare_annotation2,""))
+master_df3$APRdef2_tango <- prepare_annotation2
+master_df3$APRdef_tango[which(master_df3$APRdef2_tango == "0")] <- "Distal region"
+master_df3$APRdef_tango[which(master_df3$APRdef2_tango == "2")] <- "GK_1"
+master_df3$APRdef_tango[which(master_df3$APRdef2_tango == "3")] <- "GK_2"
+master_df3$APRdef_tango[which(master_df3$APRdef2_tango == "4")] <- "GK_3"
+master_df3$APRdef_tango[which(master_df3$APRdef2_tango %in% c("5","6","7","8","9","!","@"))] <- "FR"
+master_df3$Protein <- as.factor(master_df3$Protein)
+prepare_annotation3 <- annotateDF(prepare_annotation,"01","A1","10","1K") #GK_1
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0A","BA","K0","KL") #GK_2
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0B","CB","L0","LM") #GK_3
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0C","DC","M0","MN") #GK_4
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0D","ED","N0","NO") #GK_5
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0E","FE","O0","OP") #GK_6
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0F","GF","P0","PQ") #GK_7
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0G","HG","Q0","QR") #GK_8
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0H","IH","R0","RS") #GK_9
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0I","JI","S0","ST") #GK_10
+prepare_annotation3 <- paste(prepare_annotation3$APRdef2_tango, collapse="")
+prepare_annotation3 <- unlist(strsplit(prepare_annotation3,""))
+master_df3$Side <- prepare_annotation3
+master_df3$Side[which(master_df3$Side %in% c("0","1"))] <- "None"
+master_df3$Side[which(master_df3$Side %in% c("A","B","C","D","E","F","G","H","I","J"))] <- "N_ter"
+master_df3$Side[which(master_df3$Side %in% c("K","L","M","N","O","P","Q","R","S","T"))] <- "C_ter"
+#Define TANGO APRs ids
+tango_APRs <- subset(master_df3, APRdef_tango != "Distal region")
+j <- 1
+tango_APRs$APRcount_tango <- 0
+tango_APRs$APRcount_tango[1] <- 1
+for (i in 2:length(tango_APRs$Protein)){
+  if (i %% 10000 == 0){
+    print(i)
+  }
+  if (tango_APRs$Protein[i] != tango_APRs$Protein[i-1] | tango_APRs$Position[i] != (tango_APRs$Position[i-1]+1)){
+    j <- j + 1
+    tango_APRs$APRcount_tango[i] <- j 
+  }
+  else if (tango_APRs$Side[i-1] == "C_ter" & tango_APRs$APRdef2_tango[i-1] == 4) {
+    j <- j + 1
+    tango_APRs$APRcount_tango[i] <- j 
+  }
+  else if (tango_APRs$Side[i-1] == "C_ter" & tango_APRs$APRdef2_tango[i-1] != 4 & tango_APRs$Side[i] != "C_ter") {
+    j <- j + 1
+    tango_APRs$APRcount_tango[i] <- j 
+  }
+  else{
+    tango_APRs$APRcount_tango[i] <- j 
+  }
+}
+
+tango_APRs2 <- subset(tango_APRs, select = c(1,2,12))
+master_df3 <- merge(master_df3,tango_APRs2, by=c("Protein","Position"),all = TRUE)
+master_df3$APRcount_tango[which(is.na(master_df3$APRcount_tango))] <- 0
+master_df3$APRdef_tango[which(master_df3$APRcount_tango == 0)] <- "No"
+save(master_df3, file = "Data/RData/Random/all_tango_res_annotated.RData")
+#Summarize TANGO information
+load("Data/RData/Random/all_tango_res_annotated.RData")
+onlyapr_tango <- subset(master_df3, master_df3$APRdef_tango=="APR")
+tango_APRs <- aggregate (Residue ~ APRcount_tango, data=onlyapr_tango, FUN="paste",collapse = "")
+colnames(tango_APRs) <- c("APRcount_tango","APR")
+TotalTANGO <- aggregate (tango_Score ~ APRcount_tango, data=onlyapr_tango, FUN="sum")
+colnames(TotalTANGO) <- c("APRcount_tango","TotalTANGO")
+lengthAPR <- aggregate (length ~ APRcount_tango, data=onlyapr_tango, FUN="sum")
+colnames(lengthAPR) <- c("APRcount_tango","lengthAPR")
+startAPR <- aggregate (Position ~ APRcount_tango, data=onlyapr_tango, FUN="min")
+colnames(startAPR) <- c("APRcount_tango","startAPR")
+endAPR <- aggregate (Position ~ APRcount_tango, data=onlyapr_tango, FUN="max")
+colnames(endAPR) <- c("APRcount_tango","endAPR")
+proteins_apr <- unique(subset(onlyapr_tango, select = c(1,12)))
+topology_apr <- aggregate (Topology ~ APRcount_tango, data=onlyapr_tango, FUN="unique")
+tango_APRs <- Reduce(function(x, y) merge(x, y, all=TRUE), list(proteins_apr,tango_APRs,TotalTANGO,lengthAPR,startAPR,endAPR,topology_apr))
+tango_APRs$avgTANGO <- tango_APRs$TotalTANGO / tango_APRs$lengthAPR
+tango_APRs2 <- subset(tango_APRs, lengthAPR > 4 & lengthAPR < 16 & Topology %in% c("outside","inside")) #From 117144 to 85126
+onlyapr_tango <- onlyapr_tango[which(onlyapr_tango$APRcount_tango %in% tango_APRs2$APRcount_tango),]
+len_APR <- aggregate (length ~ APRcount_tango, data=onlyapr_tango, FUN="sum")
+colnames(len_APR)[2] <- "APR_length"
+onlyapr_tango$length <- NULL
+onlyapr_tango <- merge(onlyapr_tango,len_APR)
+master_df3$APRcount_tango[which(!master_df3$APRcount_tango %in% onlyapr_tango$APRcount_tango)] <- 0
+master_df3$APRdef_tango[which(master_df3$APRcount_tango == 0)] <- "Distal region"
+master_df3$APRdef2_tango[which(master_df3$APRcount_tango == 0)] <- 0
+master_df3$Side[which(master_df3$APRcount_tango == 0)] <- "None"
+total_scoreAPR <- aggregate (tango_Score ~ APRcount_tango, data=onlyapr_tango, sum)
+colnames(total_scoreAPR) <- c("APRcount_tango","TotalScore")
+onlyapr_tango <- merge(onlyapr_tango,total_scoreAPR,by="APRcount_tango")
+onlyapr_tango$avgScore <- onlyapr_tango$TotalScore / onlyapr_tango$APR_length
+maxAPR_Protein <- aggregate (avgScore ~ Protein, data=onlyapr_tango, max)
+colnames(maxAPR_Protein) <- c("Protein","maxProtscore")
+onlyapr_tango <- merge(onlyapr_tango,maxAPR_Protein,by="Protein")
+temp <- unique(subset(onlyapr_tango, select = c(1,2,12,14)))
+temp2 <- unique(subset(onlyapr_tango, select = c(1,15)))
+master_df3 <- merge(master_df3,temp,by = c("Protein","APRcount_tango"), all.x = TRUE)
+master_df3 <- merge(master_df3,temp2,by = c("Protein"), all.x = TRUE)
+master_df3 <- master_df3[order(master_df3$Protein, master_df3$Position),]
+rownames(master_df3) <- NULL
+master_df3$maxProtscore[which(is.na(master_df3$maxProtscore))] <- 0
+master_df3$avgScore[which(is.na(master_df3$avgScore))] <- 0
+master_df3$APR_length[which(is.na(master_df3$APR_length))] <- 0
+save(master_df3, file = "Data/RData/Random/master_df.RData")
+save(tango_APRs, file = "Data/RData/Random/tango_APRs_ALL.RData")
+save(tango_APRs2, file = "Data/RData/Random/tango_APRs.RData")
+```

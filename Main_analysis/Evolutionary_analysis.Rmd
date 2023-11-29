@@ -1,0 +1,316 @@
+---
+title: "Evolutionary_analysis"
+output: html_notebook
+---
+```{r, include=FALSE} 
+library(dplyr)
+library(ggplot2)
+library(rlist)
+library(tidyr)
+library(ggpubr)
+library(stringr)
+library(seqinr)
+library(IRanges)
+library(GenomicRanges)
+library(data.table)
+library(plyr)
+library(multcompView)
+library(DescTools)
+library(rcompanion)
+library(ComplexHeatmap)
+library(gprofiler2)
+library(ggridges)
+library(ggsci)
+```
+
+Prepare files. Run only once.
+
+```{r, include=FALSE}
+load("Data/RData/Human/master_struc2_alphafold_dssp.RData")
+load("Data/RData/Human/human_proteome.RData")
+load("Data/dbPTM/human_PTM_data.RData")
+Ensmbl_uniprot <- read.delim("Data/Human/Alignment_glyco/Ensembl_ids.tab", header=TRUE)
+Ensmbl_uniprot <- subset(Ensmbl_uniprot, select = c(1,8))
+Ensmbl_uniprot$Ensembl.transcript <- as.character(Ensmbl_uniprot$Ensembl.transcript)
+s <- strsplit(Ensmbl_uniprot$Ensembl.transcript, split = ";")
+Ensmbl_uniprot <- data.frame(Protein = rep(Ensmbl_uniprot$Entry, sapply(s, length)), Ensembl = unlist(s))
+list_names <- strsplit(as.character(Ensmbl_uniprot$Ensembl), " ")
+res <- matrix(nrow = length(Ensmbl_uniprot$Protein), ncol = 1)
+for (i in 1:length(Ensmbl_uniprot$Protein)){
+  res[i,] <- list_names[[i]][1]
+}
+Ensmbl_uniprot$Ensembl2 <- res
+length(unique(Ensmbl_uniprot$Protein)) #19370 proteins with ENSMBL IDs
+Ensmbl_uniprot <- subset(Ensmbl_uniprot, Protein %in% human_proteome$Protein)
+length(unique(Ensmbl_uniprot$Protein)) #18590 proteins with ENSMBL IDs after filtering
+#Map with proteins in the alignment
+headers <- read.table("Data/Human/Alignment_glyco/headers.txt", quote="\"", comment.char="")
+headers <- unique(headers)
+Ensmbl_uniprot <- subset(Ensmbl_uniprot, Ensembl2 %in% headers$V1) 
+#Duplicates ensemble have the same aminoacid sequence (canonical). Only pick one randomly
+Ensmbl_uniprot <- Ensmbl_uniprot[!duplicated(Ensmbl_uniprot[1]),] #17964 proteins
+#Prepare file of proteins to run with python script (save_alignments.py)
+write.table(Ensmbl_uniprot$Ensembl2, file = "Data/Human/Alignment_glyco/ensembl_prots.txt", quote = FALSE, sep = " ",
+            row.names = FALSE,col.names = FALSE)
+#Read alignments and create master DF
+setwd("Data/Human/Alignment_glyco/Alignments/")
+dirs <- list.dirs(path = ".", full.names = FALSE, recursive = FALSE)
+master_alignment = matrix((numeric(length(dirs)*100)*3), nrow = length(dirs)*100, ncol = 3)
+master_alignment <- as.data.frame(master_alignment)
+colnames(master_alignment) <- c("organism","sequence","Ensembl2")
+for (i in 1:length(dirs)){
+  print(i)
+  start <- ((i-1) * 100) + 1
+  end <- i * 100
+  temp_dir <- paste0("./",dirs[i])
+  alignment <- read.delim(paste0(temp_dir,"/alignment.txt"), header=FALSE)
+  colnames(alignment) <- c("organism","sequence")
+  alignment$Ensembl2 <-  dirs[i]
+  master_alignment[start:end,] <- alignment
+}
+Ensmbl_uniprot <- subset(Ensmbl_uniprot, select = c(1,3))
+master_alignment <- merge(master_alignment, Ensmbl_uniprot, by = "Ensembl2")
+master_alignment$sequence <- as.character(master_alignment$sequence)
+save(master_alignment, file = "Data/RData/Human/master_alignment.RData")
+```
+
+Load all datasets
+
+```{r, include=FALSE}
+load("Data/RData/Human/master_struc2_alphafold_dssp.RData")
+load("Data/dbPTM/human_PTM_data.RData")
+load("Data/RData/Human/master_alignment.RData")
+load("Data/RData/Human/human_proteome.RData")
+colnames(PTMs_df_human)[3] <- "Residue"
+master_df3_filtered <- subset(master_struc3, Topology %in% c("inside","outside"))
+rm(master_struc3)
+gc()
+all_res <- paste(master_df3_filtered$Residue, collapse = '')
+all_res <- gsub('N[^P][ST]', '210', all_res)
+all_res <- unlist(strsplit(all_res,""))
+master_df3_filtered$glyc <- all_res 
+master_df3_filtered$loc <- "No"
+master_df3_filtered$loc[which((master_df3_filtered$Nucleus == "No" & master_df3_filtered$Cytoplasm == "No" & master_df3_filtered$Mitochondrion == "No") &
+                          (master_df3_filtered$Secreted == "Yes" | master_df3_filtered$Membrane == "Yes" | master_df3_filtered$Endoplasmic_reticulum == "Yes" | master_df3_filtered$Golgi == "Yes" | master_df3_filtered$Lysosome == "Yes"))] <- "Extra"
+master_df3_filtered$loc[which((master_df3_filtered$Nucleus == "Yes" | master_df3_filtered$Cytoplasm == "Yes" | master_df3_filtered$Mitochondrion == "Yes") &
+                          (master_df3_filtered$Lysosome == "No" & master_df3_filtered$Secreted == "No" & master_df3_filtered$Membrane == "No" & master_df3_filtered$Endoplasmic_reticulum == "No" & master_df3_filtered$Golgi == "No"))] <- "Intra"
+nlinked <- subset(PTMs_df_human, Type2 == "N-linked Glycosylation_N", select = c(1,2,3,5))
+master_df3_filtered$loc[which(master_df3_filtered$Protein %in% nlinked$Protein)] <- "Extra"
+master_df3_filtered <- merge(master_df3_filtered, nlinked, by=c("Protein","Position","Residue"), all.x = TRUE)
+master_df3_filtered$glyc[which(master_df3_filtered$glyc == 0)] <- as.character(master_df3_filtered$Residue[which(master_df3_filtered$glyc == 0)])
+master_df3_filtered$glyc[which(master_df3_filtered$glyc == 1)] <- as.character(master_df3_filtered$Residue[which(master_df3_filtered$glyc == 1)])
+master_df3_filtered$glyc[which(master_df3_filtered$glyc == 2)] <- "Sequon"
+master_df3_filtered$glyc[which(master_df3_filtered$Type2 == "N-linked Glycosylation_N")] <- "N-linked Glycosylation_N"
+```
+
+Calculate conservation of sequon
+
+```{r, include=FALSE}
+GKS_3 <- subset(master_df3_filtered, glyc %in% c("Sequon","N-linked Glycosylation_N") & loc != "No" & Protein %in% master_alignment$Protein)
+GKS_3$zeros <- NA
+GKS_3$ones <- NA
+GKS_3$other <- NA
+for(i in 1:length(GKS_3$Protein)){
+  print(i)
+  temp_prot <- as.character(GKS_3$Protein[i])
+  temp_position <- GKS_3$Position[i]
+  temp_alignment <- subset(master_alignment, Protein == temp_prot)
+  temp_alignment$area <- substr(temp_alignment$sequence, temp_position, temp_position + 2)
+  temp_human <- substr(human_proteome$Sequence[which(human_proteome$Protein == temp_prot)], temp_position, temp_position + 2)
+  if(temp_alignment$area[1] != temp_human | nchar(temp_human) < 3){
+    next
+  }
+  aas <- NULL
+  for (j in 1:nrow(temp_alignment)){
+    temp_seq <- unlist(strsplit(temp_alignment$area[j],""))
+    if (length(which(names(table(temp_seq)) == "-")) != 0){
+      temp_empty <- table(temp_seq)[which(names(table(temp_seq)) == "-")]
+    } else {
+      temp_empty <- 0
+    }
+    temp_aa <- temp_seq[1]
+    temp_aa1 <- temp_seq[2]
+    temp_aa2 <- temp_seq[3]
+    if (temp_aa == "N" & temp_aa1 != "P" & temp_aa2 %in% c("S","T")){
+      temp_aa <- 1
+    }
+    if (temp_empty > 0){
+      temp_aa <- 0
+    }
+    aas <- c(aas, temp_aa)
+  }
+  zeros <- length(which(aas == 0))
+  ones <- length(which(aas == 1))
+  other <- length(which(!aas %in% c(0,1)))
+  GKS_3$zeros[i] <- zeros
+  GKS_3$ones[i] <- ones
+  GKS_3$other[i] <- other
+}
+
+GKS_4 <- subset(GKS_3, !is.na(zeros))
+table(GKS_4$loc)
+GKS_4$Side2 <- paste0(GKS_4$APRdef2_tango,"_",GKS_4$Side)
+GKS_4$enriched_pos <- "No"
+GKS_4$conserv <- GKS_4$ones / (100 - GKS_4$zeros) * 100
+GKS_4$conserv2 <- GKS_4$ones 
+GKS_4$enriched_pos[which(GKS_4$Side2 %in% c("1_None","3_N_ter","2_N_ter"))] <- "Yes"
+consv_summary <- aggregate(conserv ~ glyc + enriched_pos + loc, data=GKS_4, FUN="mean")
+consv_summary2 <- aggregate(conserv2 ~ glyc + enriched_pos + loc, data=GKS_4, FUN="mean")
+my_comparisons <- list(c("No", "Yes"))
+p <- ggplot(GKS_4, aes(y=conserv, x=as.factor(enriched_pos))) + 
+  geom_boxplot(notch=TRUE,outlier.size=1) + theme_classic() + labs(y = "Conservation", x="PTM vs Non-PTM") +
+  stat_summary(fun.y=mean, geom="point", shape=20, size=3, color="red", fill="red") + stat_compare_means(comparisons = my_comparisons)
+p + facet_grid(. ~ glyc)
+#Save it
+glyc_consv <- subset(GKS_4, select = c(1,2,3,35,36))
+save(glyc_consv, file = "Data/RData/Human/glyc_consv.RData")
+save(GKS_4, file = "Data/RData/Human/glyc_consv_all.RData")
+
+load("Data/RData/Human/glyc_consv_all.RData")
+GKS_4$loc2 <- "No"
+GKS_4$loc2[which(GKS_4$glyc == "N-linked Glycosylation_N" & GKS_4$Side2 %in% c("1_None", "2_N_ter","3_N_ter"))] <- "Glycosylated enriched position"
+GKS_4$loc2[which(GKS_4$glyc == "N-linked Glycosylation_N" & !GKS_4$Side2 %in% c("1_None", "2_N_ter","3_N_ter"))] <- "Glycosylated not enriched position"
+GKS_4$loc2[which(GKS_4$glyc == "Sequon" )] <- "Non_glycosylated sequon"
+my_comparisons <- list(c("Glycosylated enriched position", "Glycosylated not enriched position"),c("Glycosylated enriched position", "Non_glycosylated sequon"),c("Non_glycosylated sequon", "Glycosylated not enriched position"))
+table(GKS_4$loc2)
+p <- ggplot(GKS_4, aes(y=conserv, x=as.factor(loc2))) + 
+  geom_boxplot(notch=TRUE,outlier.size=1) + theme_classic() + labs(y = "Conservation") + stat_compare_means(comparisons = my_comparisons) + theme(axis.text=element_text(size=11,colour = "black"), axis.title=element_text(size=11,colour = "black"))
+p
+p <- ggplot(GKS_4, aes(y=conserv2, x=as.factor(loc2))) + 
+  geom_boxplot(notch=TRUE,outlier.size=1) + theme_classic() + labs(y = "Conservation %") + stat_compare_means(comparisons = my_comparisons) + theme(axis.text=element_text(size=11,colour = "black"), axis.title=element_text(size=11,colour = "black"))
+p
+p <- ggplot(GKS_4, aes(y=Rel_acc, x=as.factor(loc2))) + 
+  geom_boxplot(notch=TRUE,outlier.size=1) + theme_classic() + labs(y = "Solvent accessibility") + stat_compare_means(comparisons = my_comparisons) + theme(axis.text=element_text(size=11,colour = "black"), axis.title=element_text(size=11,colour = "black"))
+p
+
+my_comparisons <- list(c("Glycosylated enriched position", "Glycosylated not enriched position"))
+GKS_5 <- subset(GKS_4, GKS_4$Side2 != "0_None" & glyc == "N-linked Glycosylation_N")
+p <- ggplot(GKS_5, aes(y=conserv2, x=as.factor(loc2))) + 
+  geom_boxplot(notch=TRUE,outlier.size=1) + theme_classic() + labs(y = "Conservation") + stat_compare_means(comparisons = my_comparisons) + theme(axis.text=element_text(size=11,colour = "black"), axis.title=element_text(size=11,colour = "black"))
+p
+```
+
+Look if when "losing" a glycosylation site, if it is flank by more than one charged residue instead
+
+```{r, include=FALSE}
+#Check how many GK residues are near N-linked enriched regions
+load("Data/RData/Human/tango_APRs.RData")
+load("Data/RData/Human/glyc_consv_all.RData")
+load("Data/RData/Human/human_proteome.RData")
+load("Data/RData/Human/master_alignment.RData")
+GKS_4 <- subset(GKS_4, APRdef2_tango == 2 & Side == "N_ter")
+GKS_4$is_lost_gk <- "NA"
+GKS_4$not_lost_gk <- "NA"
+GKS_4$is_lost_R <- "NA"
+GKS_4$not_lost_R <- "NA"
+GKS_4$is_lost_K <- "NA"
+GKS_4$not_lost_K <- "NA"
+GKS_4$is_lost_D <- "NA"
+GKS_4$not_lost_D <- "NA"
+GKS_4$is_lost_E <- "NA"
+GKS_4$not_lost_E <- "NA"
+GKS_4$is_lost_P <- "NA"
+GKS_4$not_lost_P <- "NA"
+for (i in 1:nrow(GKS_4)){
+  print(i)
+  temp_prot <- as.character(GKS_4$Protein[i])
+  temp_apr <- GKS_4$APRcount_tango[i]
+  temp_apr <- subset(tango_APRs2, APRcount_tango == temp_apr)
+  temp_alignment <- subset(master_alignment, Protein == temp_prot)
+  temp_alignment$area <- substr(temp_alignment$sequence, temp_apr$startAPR - 3, temp_apr$endAPR + 3)
+  temp_human <- substr(human_proteome$Sequence[which(human_proteome$Protein == temp_prot)], temp_apr$startAPR - 3, temp_apr$endAPR + 3)
+  if(temp_alignment$area[1] != temp_human){
+    next
+  }
+  temp_table <- t(as.data.frame(strsplit(temp_alignment$area,"")))
+  rownames(temp_table) <- NULL
+  temp_length <- ncol(temp_table)
+  temp_table <- as.data.frame(temp_table)
+  temp_table$area <- temp_alignment$area
+  temp_table$consv <- "Yes"
+  temp_table$sequon <- "No"
+  temp_table$number_gks <- NA
+  temp_table$number_r <- NA
+  temp_table$number_k <- NA
+  temp_table$number_d <- NA
+  temp_table$number_e <- NA
+  temp_table$number_p <- NA
+  temp_table$consv[which(grepl("-", temp_table$area))] <- "No"
+  temp_table$sequon[which(temp_table$V3 == "N" & temp_table$V4 != "P" & temp_table$V5 %in% c("S","T"))] <- "Yes"
+  temp_table$number_gks <- str_count(temp_table$area, "R") + str_count(temp_table$area, "D") + str_count(temp_table$area, "E") + 
+    str_count(temp_table$area, "K")+ str_count(temp_table$area, "P")
+  temp_table$number_r <- str_count(temp_table$area, "R") 
+  temp_table$number_k <- str_count(temp_table$area, "K") 
+  temp_table$number_e <- str_count(temp_table$area, "E") 
+  temp_table$number_d <- str_count(temp_table$area, "D") 
+  temp_table$number_p <- str_count(temp_table$area, "P") 
+  means_gk <- aggregate (number_gks ~ sequon + consv, data=temp_table, FUN="mean")
+  means_r <- aggregate (number_r ~ sequon + consv, data=temp_table, FUN="mean")
+  means_k <- aggregate (number_k ~ sequon + consv, data=temp_table, FUN="mean")
+  means_d <- aggregate (number_d ~ sequon + consv, data=temp_table, FUN="mean")
+  means_e <- aggregate (number_e ~ sequon + consv, data=temp_table, FUN="mean")
+  means_p <- aggregate (number_p ~ sequon + consv, data=temp_table, FUN="mean")
+  GKS_4$is_lost_gk[i] <- subset(means_gk, consv == "Yes" & sequon == "No")[3]
+  GKS_4$not_lost_gk[i] <- subset(means_gk, consv == "Yes" & sequon == "Yes")[3]
+  GKS_4$is_lost_R[i] <- subset(means_r, consv == "Yes" & sequon == "No")[3]
+  GKS_4$not_lost_R[i] <- subset(means_r, consv == "Yes" & sequon == "Yes")[3]
+  GKS_4$is_lost_K[i] <- subset(means_k, consv == "Yes" & sequon == "No")[3]
+  GKS_4$not_lost_K[i] <- subset(means_k, consv == "Yes" & sequon == "Yes")[3]
+  GKS_4$is_lost_D[i] <- subset(means_d, consv == "Yes" & sequon == "No")[3]
+  GKS_4$not_lost_D[i] <- subset(means_d, consv == "Yes" & sequon == "Yes")[3]
+  GKS_4$is_lost_E[i] <- subset(means_e, consv == "Yes" & sequon == "No")[3]
+  GKS_4$not_lost_E[i] <- subset(means_e, consv == "Yes" & sequon == "Yes")[3]
+  GKS_4$is_lost_P[i] <- subset(means_p, consv == "Yes" & sequon == "No")[3]
+  GKS_4$not_lost_P[i] <- subset(means_p, consv == "Yes" & sequon == "Yes")[3]
+}
+GKS_5 <- subset(GKS_4, is_lost_gk != "numeric(0)" & conserv2 > 10)
+GKS_5$not_lost_gk <- as.numeric(unlist(GKS_5$not_lost_gk))
+GKS_5$is_lost_gk <- as.numeric(unlist(GKS_5$is_lost_gk))
+GKS_5$is_lost_R <- as.numeric(unlist(GKS_5$is_lost_R))
+GKS_5$not_lost_R <- as.numeric(unlist(GKS_5$not_lost_R))
+GKS_5$is_lost_K <- as.numeric(unlist(GKS_5$is_lost_K))
+GKS_5$not_lost_K <- as.numeric(unlist(GKS_5$not_lost_K))
+GKS_5$is_lost_D <- as.numeric(unlist(GKS_5$is_lost_D))
+GKS_5$not_lost_D <- as.numeric(unlist(GKS_5$not_lost_D))
+GKS_5$is_lost_E <- as.numeric(unlist(GKS_5$is_lost_E))
+GKS_5$not_lost_E <- as.numeric(unlist(GKS_5$not_lost_E))
+GKS_5$is_lost_P <- as.numeric(unlist(GKS_5$is_lost_P))
+GKS_5$not_lost_P <- as.numeric(unlist(GKS_5$not_lost_P))
+table(GKS_5$glyc)
+GKS_5 <- subset(GKS_5, !is.na(is_lost_gk))
+
+GKS_5$tango_bin <- NA
+GKS_5$tango_bin[which(GKS_5$avgScore < 50)] <- "(0,50)"
+GKS_5$tango_bin[which(GKS_5$avgScore >= 50)] <- "(50,100)"
+
+aggregate (not_lost_gk ~ glyc + tango_bin, data=GKS_5, FUN="mean")
+aggregate (is_lost_gk ~ glyc + tango_bin, data=GKS_5, FUN="mean")
+
+GK6 <- tidyr::gather(GKS_5,"state","n_gks",39:40)
+GK6$tango_bin <- factor(GK6$tango_bin,levels = c("(0,50)","(50,100)"),ordered = TRUE)
+GK6$grup_variable <- paste0(GK6$glyc,"_",GK6$state)
+GK6$grup_variable <- factor(GK6$grup_variable,levels = c("N-linked Glycosylation_N_not_lost_gk","Sequon_not_lost_gk","N-linked Glycosylation_N_is_lost_gk","Sequon_is_lost_gk"),ordered = TRUE)
+my_comparisons <- list(c("Sequon_not_lost_gk","N-linked Glycosylation_N_not_lost_gk"),c("Sequon_is_lost_gk","N-linked Glycosylation_N_is_lost_gk"),
+                       c("Sequon_not_lost_gk","Sequon_is_lost_gk"),c("N-linked Glycosylation_N_not_lost_gk","N-linked Glycosylation_N_is_lost_gk"))
+
+p <- ggplot(GK6, aes(y=n_gks, x=as.factor(grup_variable), fill=glyc)) + 
+  geom_boxplot(notch=TRUE,outlier.size=1) + theme_classic() + labs(y = "Mean number of nonmodified gatekeepers per APR", x="") + stat_compare_means(comparisons = my_comparisons, method='t.test',p.adjust.method = "bonferroni")
+p + facet_grid(. ~ tango_bin) + theme(axis.text=element_text(size=11,colour = "black"), axis.title=element_text(size=11,colour = "black")) 
+GK7 <- subset(GK6, tango_bin == "(0,50)")
+t_test <- compare_means(n_gks ~ grup_variable, comparisons = my_comparisons, p.adjust.method = "bonferroni", method='wilcox', data = GK7)
+GK8 <- subset(GK6, tango_bin == "(50,100)")
+t_test <- compare_means(n_gks ~ grup_variable, comparisons = my_comparisons, p.adjust.method = "bonferroni", method='wilcox', data = GK8)
+
+aggregate (is_lost_R ~ glyc + tango_bin, data=GKS_5, FUN="mean")
+aggregate (not_lost_R ~ glyc + tango_bin, data=GKS_5, FUN="mean")
+aggregate (is_lost_K ~ glyc + tango_bin, data=GKS_5, FUN="mean")
+aggregate (not_lost_K ~ glyc + tango_bin, data=GKS_5, FUN="mean")
+aggregate (is_lost_D ~ glyc + tango_bin, data=GKS_5, FUN="mean")
+aggregate (not_lost_D ~ glyc + tango_bin, data=GKS_5, FUN="mean")
+aggregate (is_lost_E ~ glyc + tango_bin, data=GKS_5, FUN="mean")
+aggregate (not_lost_E ~ glyc + tango_bin, data=GKS_5, FUN="mean")
+aggregate (is_lost_P ~ glyc + tango_bin, data=GKS_5, FUN="mean")
+aggregate (not_lost_P ~ glyc + tango_bin, data=GKS_5, FUN="mean")
+
+table(GKS_5$tango_bin, GKS_5$glyc)
+```

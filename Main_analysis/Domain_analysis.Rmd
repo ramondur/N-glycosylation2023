@@ -1,0 +1,421 @@
+---
+title: "Domain analysis human"
+output: html_notebook
+---
+```{r, include=FALSE} 
+library(dplyr)
+library(ggplot2)
+library(rlist)
+library(tidyr)
+library(ggpubr)
+library(stringr)
+library(seqinr)
+library(IRanges)
+library(GenomicRanges)
+library(data.table)
+library(plyr)
+library(multcompView)
+library(DescTools)
+library(rcompanion)
+library(ComplexHeatmap)
+library(gprofiler2)
+library(ggridges)
+library(ggsci)
+library(praise)
+library(bio3d)
+library(randomForest)
+library(imbalance)
+```
+
+Out of all APRs in proteins that follow the secretory pathway, only 7% are flanked by N-glycans. The question then arises of why some APRs, or the proteins baring those APRs, require the extra level of protection granted by N-linked glycosylation. 
+
+```{r}
+#Load dataset
+load("Data/RData/Human/master_struc2_alphafold_dssp.RData")
+load("Data/dbPTM/human_PTM_data.RData")
+colnames(PTMs_df_human)[3] <- "Residue"
+PTMs_df_human <- subset(PTMs_df_human, Type2 == "N-linked Glycosylation_N")
+master_df3_filtered <- subset(master_struc3, Topology %in% c("inside","outside"))
+master_df3_filtered$APRdef_tango[which(master_df3_filtered$APRdef_tango == "FR")] <- "Distal region"
+master_df3_filtered$APRdef2_tango[which(master_df3_filtered$APRdef_tango == "Distal region")] <- "0"
+rm(master_struc3)
+gc()
+master_df3_filtered <- merge(master_df3_filtered,PTMs_df_human, by=c("Protein","Position","Residue"), all.x = T)
+master_df3_filtered$loc <- "No"
+master_df3_filtered$loc[which((master_df3_filtered$Nucleus == "No" & master_df3_filtered$Cytoplasm == "No" & master_df3_filtered$Mitochondrion == "No") &
+                                (master_df3_filtered$Secreted == "Yes" | master_df3_filtered$Membrane == "Yes" | master_df3_filtered$Endoplasmic_reticulum == "Yes" | master_df3_filtered$Golgi == "Yes" | master_df3_filtered$Lysosome == "Yes"))] <- "Extra"
+master_df3_filtered$loc[which((master_df3_filtered$Nucleus == "Yes" | master_df3_filtered$Cytoplasm == "Yes" | master_df3_filtered$Mitochondrion == "Yes") &
+                                (master_df3_filtered$Secreted == "No" & master_df3_filtered$Membrane == "No" & master_df3_filtered$Endoplasmic_reticulum == "No" & master_df3_filtered$Golgi == "No" & master_df3_filtered$Lysosome == "No"))] <- "Intra"
+nlinked <- subset(PTMs_df_human, Type2 == "N-linked Glycosylation_N", select = c(1,2,3,5))
+master_df3_filtered$loc[which(master_df3_filtered$Protein %in% nlinked$Protein)] <- "Extra"
+master_df3_filtered$Type <- NULL
+master_df3_filtered$Type2[which(is.na(master_df3_filtered$Type2))] <- "No"
+load("/Users/u0125634/Documents/PhD/Projects/Sub_location/Data/CATH_domains/domains.RData")
+domains <- subset(domains, length.domain > 25 & length.domain < 500)
+domains2 <- unique(subset(domains, TMHMM_domain == "No"))
+domains2$number.glyc.100aa <- (domains2$glyc_enriched + domains2$glyc_other)  / domains2$length.domain * 100
+domains2 <- subset(domains2, select = c(1,3,5,6,9,10,13,19,30,31))
+gc()
+```
+
+Merge domain dataset and general dataset
+
+```{r}
+dt1 <- as.data.table(domains2)
+dt2 <- as.data.table(master_df3_filtered)
+gr1 = GRanges(Rle(dt1$Protein), IRanges(as.numeric(dt1$begin.domain), as.numeric(dt1$end.domain)))
+gr2 = GRanges(Rle(dt2$Protein), IRanges(as.numeric(dt2$Position),as.numeric(dt2$Position)))
+zone.ind <- findOverlaps(gr2, gr1, select="arbitrary")
+dt2$Domain <- dt1$CATH.family.ID[zone.ind]
+dt2$Domain2 <- dt1$begin.domain[zone.ind]
+dt2$Domain <- paste0(dt2$Domain,"_",dt2$Domain2)
+dt2$CATH.class <- dt1$CATH.class[zone.ind]
+dt2$Co <- dt1$relative_co[zone.ind]
+dt2$end_domain <- dt1$end.domain[zone.ind]
+dt2$length_domain <- dt1$length.domain[zone.ind]
+dt2$number_APR_100 <- dt1$number.APR.100aa[zone.ind]
+dt2$number_glyc_100 <- dt1$number.glyc.100aa[zone.ind]
+dt2$number.disulfide.100aa <- dt1$number.disulfide.100aa[zone.ind]
+master_df3_filtered <- as.data.frame(dt2)
+rm(dt2,dt1,gr1,gr2)
+gc()
+```
+
+Add pI (isolectric point)
+
+```{r}
+domain_sequences <- as.data.frame(aggregate (Residue ~ Protein + Domain, data=master_df3_filtered, FUN="paste",collapse = ""))
+domain_sequences <- subset(domain_sequences, Domain != "NA_NA")
+for (i in 1:nrow(domain_sequences)){
+  print(i)
+  prot <- s2c(domain_sequences$Residue[i])
+  domain_sequences$pi[i] <- computePI(prot)
+}
+domain_sequences <- subset(domain_sequences, select = c(1,2,4))
+save(domain_sequences, file = "Data/RData/Human/domains_pi.RData")
+```
+
+Prepare dataset for random forest
+
+```{r}
+#load("Data/RData/Human/domains_pi.RData")
+#master_df3_filtered <- merge(master_df3_filtered,domain_sequences, all.x = TRUE)
+#master_df3_filtered <- master_df3_filtered[order(master_df3_filtered$Protein, master_df3_filtered$Position),]
+onlyapr_tango <- subset(master_df3_filtered, APRdef_tango == "APR" & loc == "Extra")
+onlyapr_tango$length <- 1
+all_tango <- subset(master_df3_filtered, APRdef_tango!="Distal region" & loc == "Extra")
+all_tango$length <- 1
+charged_res <- aggregate (Residue ~ APRcount_tango, data=all_tango, function(x) sum(x %in% c("E","D","K","R")))
+colnames(charged_res) <- c("APRcount_tango","Number_charged_res")
+cysteines_res <- aggregate (Residue ~ APRcount_tango, data=all_tango, function(x) sum(x == c("C")))
+colnames(cysteines_res) <- c("APRcount_tango","Number_cys")
+tango_APRs <- aggregate (Residue ~ APRcount_tango, data=onlyapr_tango, FUN="paste",collapse = "")
+colnames(tango_APRs) <- c("APRcount_tango","APR")
+TotalTANGO <- aggregate (tango_Score ~ APRcount_tango, data=onlyapr_tango, FUN="sum")
+colnames(TotalTANGO) <- c("APRcount_tango","TotalTANGO")
+lengthAPR <- aggregate (length ~ APRcount_tango, data=onlyapr_tango, FUN="sum")
+colnames(lengthAPR) <- c("APRcount_tango","lengthAPR")
+startAPR <- aggregate (Position ~ APRcount_tango, data=onlyapr_tango, FUN="min")
+colnames(startAPR) <- c("APRcount_tango","startAPR")
+endAPR <- aggregate (Position ~ APRcount_tango, data=onlyapr_tango, FUN="max")
+colnames(endAPR) <- c("APRcount_tango","endAPR")
+proteins_apr <- unique(subset(onlyapr_tango, select = c(1,6)))
+domains_apr <- aggregate (Domain ~ APRcount_tango, data=onlyapr_tango, FUN="unique")
+colnames(domains_apr) <- c("APRcount_tango","Domain")
+tango_APRs <- Reduce(function(x, y) merge(x, y, all=TRUE), list(proteins_apr,tango_APRs,TotalTANGO,lengthAPR,startAPR,endAPR,domains_apr,charged_res,cysteines_res))
+tango_APRs$avgTANGO <- tango_APRs$TotalTANGO / tango_APRs$lengthAPR
+tango_APRs$Domain2 <- "Good"
+tango_APRs$Domain2[which(grepl("c(", tango_APRs$Domain, fixed = TRUE))] <- "Bad"
+tango_APRs$Domain2[which(grepl("NA_", tango_APRs$Domain, fixed = TRUE))] <- "Bad"
+tango_APRs2 <- subset(tango_APRs, Domain2 == "Good") #After sub-setting we go from 26588 SP APRs to 15205 APRs (57.2 %).
+tango_APRs2$Domain <- paste0(tango_APRs2$Domain,"_",tango_APRs2$Protein)
+domains_apr2 <- unique(subset(onlyapr_tango, select = c(6,39:46)))
+colnames(domains_apr2) <- c("APRcount_tango","start_domain","CATH.class","contact_order","end_domain","length_domain","number_APR_100aa","number_glyc_100aa","number.disulfide.100aa")
+tango_APRs3 <- merge(tango_APRs2,domains_apr2, by = "APRcount_tango")
+pureTango <- aggregate (pure_Tango ~ APRcount_tango, data=onlyapr_tango, FUN="mean")
+colnames(pureTango) <- c("APRcount_tango","pure_Tango")
+acc_tango <- aggregate (Rel_acc ~ APRcount_tango, data=onlyapr_tango, FUN="mean")
+colnames(acc_tango) <- c("APRcount_tango","accessibility")
+dis_tango <- aggregate (ALPHA_SCORE ~ APRcount_tango, data=onlyapr_tango, FUN="mean")
+colnames(dis_tango) <- c("APRcount_tango","disorder")
+tango_APRs3 <- merge(tango_APRs3,pureTango, by = "APRcount_tango")
+tango_APRs3 <- merge(tango_APRs3,acc_tango, by = "APRcount_tango")
+tango_APRs3 <- merge(tango_APRs3,dis_tango, by = "APRcount_tango")
+tango_APRs3$rel_position <-  (tango_APRs3$end_domain - tango_APRs3$startAPR) / (tango_APRs3$end_domain - tango_APRs3$start_domain)
+tango_APRs3$glyc <- "No"
+for (i in 1:nrow(tango_APRs3)){
+  temp_protein <- as.character(tango_APRs3$Protein[i])
+  temp_start <- tango_APRs3$startAPR[i]
+  temp_end <- tango_APRs3$endAPR[i]
+  temp_domain_start <- tango_APRs3$start_domain[i]
+  temp_domain_end <- tango_APRs3$end_domain[i]
+  glyc_prot <- subset(nlinked, Protein == temp_protein)
+  if (nrow(glyc_prot) == 0){
+    next
+  }
+  tango_APRs3$glyc[i] <- "Protein"
+  glyc_domain <- subset(glyc_prot, Position %in% c(temp_domain_start:temp_domain_end))
+  if (nrow(glyc_domain) == 0){
+    next
+  }
+  tango_APRs3$glyc[i] <- "Domain"
+  glyc_enriched <- subset(glyc_prot, Position %in% c((temp_start-2)):(temp_end))
+  if (nrow(glyc_enriched) == 0){
+    next
+  }
+  tango_APRs3$glyc[i] <- "Enriched"
+}
+tango_APRs3 <- subset(tango_APRs3, number_APR_100aa != 0)
+```
+
+Exploratory analysis 
+
+```{r}
+#APR level
+tango_APRs3$glyc[tango_APRs3$glyc == "Protein"] <- "No"
+table(tango_APRs3$glyc)
+my_comparisons <- list(c("No","Enriched"),c("Domain","Enriched"))
+tango_APRs3$glyc <- factor(tango_APRs3$glyc,
+                      levels = c('No','Domain','Enriched'),ordered = TRUE)
+
+p<-ggplot(tango_APRs3, aes(x=glyc, y=lengthAPR)) +  #big diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE) + theme_bw()
+p
+p<-ggplot(tango_APRs3, aes(x=glyc, y=avgTANGO)) +  #small diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE) + theme_bw()
+p
+p<-ggplot(tango_APRs3, aes(x=glyc, y=accessibility)) +  #small diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE) + theme_classic() + theme(axis.text.x = element_text(color="black", size=12),
+        axis.text.y = element_text(color="black",size=12), axis.title=element_text(size=12,colour = "black"),
+        legend.position="none") + labs(x = "", y = "Average solvent accessibility of APR") + stat_compare_means(comparisons = my_comparisons)
+p
+p<-ggplot(tango_APRs3, aes(x=glyc, y=disorder)) +  #no diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE) + theme_bw()
+p
+p<-ggplot(tango_APRs3, aes(x=glyc, y=Number_charged_res)) +  #small diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE) + theme_classic() + theme(axis.text.x = element_text(color="black", size=12),
+        axis.text.y = element_text(color="black",size=12), axis.title=element_text(size=12,colour = "black"),
+        legend.position="none") + labs(x = "", y = "Number of charged residues within or flanking the APR") + stat_compare_means(comparisons = my_comparisons)
+p
+p<-ggplot(tango_APRs3, aes(x=glyc, y=Number_cys)) +  #small diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE) + theme_classic() + theme(axis.text.x = element_text(color="black", size=12),
+        axis.text.y = element_text(color="black",size=12), axis.title=element_text(size=12,colour = "black"),
+        legend.position="none") + labs(x = "", y = "Number of cysteines within or flanking the APR") + stat_compare_means(comparisons = my_comparisons)
+p
+p<-ggplot(tango_APRs3, aes(x=glyc, y=TotalTANGO)) +  #no diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE) + theme_bw()
+p
+#Domain level
+p<-ggplot(tango_APRs3, aes(x=glyc, y=rel_position)) +  #small diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE)
+p
+p<-ggplot(tango_APRs3, aes(x=glyc, y=contact_order)) +  #big diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE)
+p
+p<-ggplot(tango_APRs3, aes(x=glyc, y=number_APR_100aa)) +  #small diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE)
+p
+p<-ggplot(tango_APRs3, aes(x=glyc, y=number.disulfide.100aa)) +  #small diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE)
+p
+p<-ggplot(tango_APRs3, aes(x=glyc, y=length_domain)) +  #small diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE)
+p
+```
+
+Random forest all domains. Under sampling and over sampling
+
+```{r}
+tango_pca <- subset(tango_APRs3, select = c(1,5,9,10,11,15,17,18,20,22,23,24,25))
+rownames(tango_pca) <- tango_pca$APRcount_tango
+tango_pca$APRcount_tango <- NULL
+tango_pca$glyc[which(tango_pca$glyc != "Enriched")] <- "No"
+tango_pca$glyc <- as.factor(tango_pca$glyc)
+table(tango_pca$glyc)
+#undersampling
+set.seed(4)
+tango_pca2  <- tango_pca %>% group_by(glyc) %>% sample_n(size = 780)
+tango_pca2$glyc <- as.factor(as.character(tango_pca2$glyc))
+rf <-randomForest(glyc~.,data=tango_pca2, mtry=3, importance=TRUE,ntree=500)
+print(rf)
+#Evaluate variable importance
+importance(rf)
+varImpPlot(rf)
+#oversampling
+tango_pca$glyc <- as.character(tango_pca$glyc)
+tango_pca$glyc <- as.factor(tango_pca$glyc)
+hacide.rose <- ROSE(glyc ~ ., data=tango_pca, seed=1, N= 28000)$data
+rf <-randomForest(glyc~.,data=hacide.rose, mtry=3, importance=TRUE,ntree=500)
+print(rf)
+#Evaluate variable importance
+importance(rf)
+varImpPlot(rf)
+```
+
+Divide by domains and generate plots
+
+```{r}
+domains_apr2 <- unique(subset(tango_APRs3, select = c(8,14,15,17,18,19,20)))
+mean_aggregation_domain <- aggregate(avgTANGO ~ Domain, data=tango_APRs3, FUN="max")
+domains_apr2 <- merge(domains_apr2, mean_aggregation_domain)
+domains_apr2$glyc <- "Glyco not EP"
+domains_apr2$glyc[which(domains_apr2$Domain %in% tango_APRs3$Domain[which(tango_APRs3$glyc == "Enriched")])] <- "Glyco EP"
+domains_apr2$glyc[which(domains_apr2$Domain %in% tango_APRs3$Domain[which(tango_APRs3$glyc == "No")])] <- "No"
+domains_apr2 <- unique(domains_apr2)
+table(domains_apr2$glyc) / nrow(domains_apr2) * 100
+#Avg. TANGO and contact order
+d <- ggplot(domains_apr2, aes(contact_order, avgTANGO)) + theme_bw()
+d + geom_density_2d_filled() + facet_wrap(vars(glyc)) + xlim(0, 0.25) + ylim(0, 100) + labs(y = "Aggregation propensity", x="Contact order")
+#APRs Contact order
+my_comparisons <- list(c("No","Glyco EP"),c("Glyco not EP","Glyco EP"))
+domains_apr2$glyc <- factor(domains_apr2$glyc,
+                      levels = c('No','Glyco not EP','Glyco EP'),ordered = TRUE)
+#APRs solvent accessibility
+p<-ggplot(domains_apr2, aes(x=glyc, y=contact_order)) +  #small diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE) + theme_classic() + theme(axis.text.x = element_text(color="black", size=12),
+        axis.text.y = element_text(color="black",size=12), axis.title=element_text(size=12,colour = "black"),
+        legend.position="none") + labs(x = "", y = "Number APRs per 100aa") + stat_compare_means(comparisons = my_comparisons)
+p
+```
+
+Is any topology more abundant in domains with an APR protected by an N-glycan?
+
+```{r}
+tango_APRs33 <- subset(tango_APRs3, CATH.class %in% names(which(table(tango_APRs3$CATH.class) > 100)))
+table(tango_APRs33$glyc,tango_APRs33$CATH.class)
+log((table(tango_APRs33$glyc,tango_APRs33$CATH.class)[2,] / table(tango_APRs33$glyc)[2]) / (table(tango_APRs33$CATH.class) / nrow(tango_APRs33)))
+log((table(tango_APRs33$glyc,tango_APRs33$CATH.class)[3,] / table(tango_APRs33$glyc)[3]) / (table(tango_APRs33$CATH.class) / nrow(tango_APRs33)))
+aggregate (contact_order ~ CATH.class, data=domains_apr2, FUN="mean")
+aggregate (length_domain ~ CATH.class, data=domains_apr2, FUN="mean")
+aggregate (avgTANGO ~ CATH.class, data=domains_apr2, FUN="mean")
+aggregate (number_APR_100aa ~ CATH.class, data=domains_apr2, FUN="mean")
+aggregate (number.disulfide.100aa ~ CATH.class, data=domains_apr2, FUN="mean")
+aggregate (number_glyc_100aa ~ CATH.class, data=domains_apr2, FUN="mean")
+```
+
+Within domains 2.60, which APRs need more protection?
+
+```{r}
+domains_apr3 <- domains_apr2[grep("2.60.", domains_apr2$CATH.class), ]
+#domains_apr3 <- subset(domains_apr3, length_domain %in% c(90:120))
+table(domains_apr3$glyc)
+my_comparisons <- list(c("No","Glyco EP"),c("Glyco not EP","Glyco EP"))
+domains_apr3$glyc <- factor(domains_apr3$glyc,
+                      levels = c('No','Glyco not EP','Glyco EP'),ordered = TRUE)
+domains_apr3$num_aprs <- domains_apr3$number_APR_100aa * domains_apr3$length_domain / 100
+#Domain level
+p<-ggplot(domains_apr3, aes(x=glyc, y=contact_order)) +  #big diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE)
+p
+p<-ggplot(domains_apr3, aes(x=glyc, y=number_APR_100aa)) +  #small diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE) + theme_classic() + theme(axis.text.x = element_text(color="black", size=12),
+        axis.text.y = element_text(color="black",size=12), axis.title=element_text(size=12,colour = "black"),
+        legend.position="none") + labs(x = "", y = "Number APRs per 100aa") + stat_compare_means(comparisons = my_comparisons)
+p
+p<-ggplot(domains_apr3, aes(x=glyc, y=number.disulfide.100aa)) +  #small diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE)
+p
+p<-ggplot(domains_apr3, aes(x=glyc, y=length_domain)) +  #small diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE)
+p
+p<-ggplot(domains_apr3, aes(x=glyc, y=avgTANGO)) +  #small diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE) + theme_classic() + theme(axis.text.x = element_text(color="black", size=12),
+        axis.text.y = element_text(color="black",size=12), axis.title=element_text(size=12,colour = "black"),
+        legend.position="none") + labs(x = "", y = "Max. aggregation propensity") + stat_compare_means(comparisons = my_comparisons)
+p
+p<-ggplot(domains_apr3, aes(x=glyc, y=number_glyc_100aa)) +  #small diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE) + theme_classic() + theme(axis.text.x = element_text(color="black", size=12),
+        axis.text.y = element_text(color="black",size=12), axis.title=element_text(size=12,colour = "black"),
+        legend.position="none") + labs(x = "", y = "number_glyc_100aa") + stat_compare_means(comparisons = my_comparisons)
+p
+
+#In full proteins
+master_df3_filtered$Side2 <- paste0(master_df3_filtered$APRdef2_tango,"_",master_df3_filtered$Side)
+prueba <- master_df3_filtered[grep("2.60.", master_df3_filtered$Domain), ]
+glyc <- unique(subset(prueba, Type2 == "N-linked Glycosylation_N" & Side2 %in% c("1_None","3_N_ter","2_N_ter"), select = 1)) #358
+prots_glyc <- unique(subset(prueba, loc == "Extra" & Type2 == "N-linked Glycosylation_N" & !Protein %in% glyc$Protein, select = 1)) #578
+prots_extra <- unique(subset(prueba, loc == "Extra" & !Protein %in% glyc$Protein & !Protein %in% prots_glyc$Protein, select = 1)) #406
+master_df3_filtered$glyc_type <- NA
+master_df3_filtered$glyc_type[which(master_df3_filtered$Protein %in% glyc$Protein)] <- "EP"
+master_df3_filtered$glyc_type[which(master_df3_filtered$Protein %in% prots_glyc$Protein)] <- "not EP"
+master_df3_filtered$glyc_type[which(master_df3_filtered$Protein %in% prots_extra$Protein)] <- "Other"
+protein_size <- unique(subset(master_df3_filtered, !is.na(glyc_type), select = c(1, 4, 48)))
+aggregate (protein_length ~ glyc_type, data=protein_size, FUN="mean")
+
+prueba <- master_df3_filtered[grep("2.60.", master_df3_filtered$Domain), ]
+domains_size <- unique(subset(prueba, !is.na(glyc_type), select = c(1, 38, 48)))
+domains_size$len <- 1
+domains_size_num <- aggregate(len ~ glyc_type + Protein, data=domains_size, FUN="sum")
+aggregate(len ~ glyc_type, data=domains_size_num, FUN="median")
+
+my_comparisons <- list(c("Other","EP"),c("not EP","EP"))
+protein_size$glyc_type <- factor(protein_size$glyc_type,
+                      levels = c('Other','not EP','EP'),ordered = TRUE)
+p<-ggplot(protein_size, aes(x=glyc_type, y=protein_length)) +  #small diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE) + theme_classic() + theme(axis.text.x = element_text(color="black", size=12),
+        axis.text.y = element_text(color="black",size=12), axis.title=element_text(size=12,colour = "black"),
+        legend.position="none") + labs(x = "", y = "Protein length") + stat_compare_means(comparisons = my_comparisons) +
+   scale_y_continuous(limits=c(0, 2500))
+p
+
+domains_size_num$glyc_type <- factor(domains_size_num$glyc_type,
+                      levels = c('Other','not EP','EP'),ordered = TRUE)
+p<-ggplot(domains_size_num, aes(x=glyc_type, y=len)) +  #small diff
+  geom_boxplot(position=position_dodge(1), notch = TRUE) + theme_classic() + theme(axis.text.x = element_text(color="black", size=12),
+        axis.text.y = element_text(color="black",size=12), axis.title=element_text(size=12,colour = "black"),
+        legend.position="none") + labs(x = "", y = "Number b-sandwich domain per protein") + stat_compare_means(comparisons = my_comparisons) +
+        scale_y_continuous(limits=c(0, 20))
+p
+```
+
+Check relative position of protected APR like Judith Frydman
+
+```{r}
+tango_APR4 <- tango_APRs3[grep("2.60.", tango_APRs3$Domain), ]
+ep_domain <- subset(tango_APR4, glyc == "Enriched")
+ep_domain$start_domain2 <- 1
+ep_domain$end_domain2 <- ep_domain$length_domain + 1
+ep_domain$startAPR2 <- (ep_domain$startAPR - ep_domain$start_domain) + 1
+ep_domain <- ep_domain[order(ep_domain$end_domain2,ep_domain$Protein),]
+ep_domain$Domain <- as.character(ep_domain$Domain)
+ep_domain$Domain <- paste0(ep_domain$Domain, "_", ep_domain$Protein)
+ep_domain2 <- unique(subset(ep_domain, select = c(8,27)))
+rownames(ep_domain2) <- NULL
+ep_domain2$id <- rownames(ep_domain2)
+ep_domain3 <- unique(subset(ep_domain, select = c(8,27,28)))
+ep_domain3 <- merge(ep_domain3,ep_domain2)
+p<-ggplot(data=ep_domain2, aes(x= reorder(id, -end_domain2) , y=end_domain2)) +
+  geom_bar(stat="identity", width = 1, fill = "lightgrey") + coord_flip() + theme_classic()  + 
+  geom_point(data=ep_domain3, aes(x=id, y=startAPR2, fill="black")) +
+  theme(axis.ticks.y = element_blank(), axis.text.x = element_text(color="black", size=12),
+        axis.text.y = element_text(color="black",size=5), axis.title=element_text(size=12,colour = "black"),
+        legend.position="none") +
+  labs(x = "Domain", y = "Residue position") 
+p
+tango_APR4 <- tango_APRs3[grep("2.60.", tango_APRs3$Domain), ]
+tango_APR4 <- subset(tango_APR4, glyc != "No")
+d <- ggplot(tango_APR4, aes(rel_position, avgTANGO)) + theme_bw()
+d + geom_density_2d_filled() + facet_wrap(vars(glyc)) + xlim(0, 1) + ylim(0, 100) + labs(y = "Aggregation propensity", x="Relative position in domain") 
+```
+
+Check UGGT only for 2.60 domains
+
+```{r}
+tango_APR4 <- tango_APRs3[grep("2.60.", tango_APRs3$Domain), ]
+ep_domain <- unique(subset(tango_APR4, glyc == "Enriched", select = 2)) #350
+dp_domain <- unique(subset(tango_APR4, glyc == "Domain" & !Protein %in% ep_domain$Protein, select = 2)) #511
+length(unique(ep_domain$Protein))
+length(unique(dp_domain$Protein))
+UGT1_subs <- read.table("Data/Human/Other/UGT1_subs.txt", quote="\"", comment.char="")
+UGT1_subs <- unique(UGT1_subs$V1)
+UGT2_subs <- read.table("Data/Human/Other/UGT2_subs.txt", quote="\"", comment.char="")
+UGT2_subs <- unique(UGT2_subs$V1)
+ALG6_ko <- read.table("Data/Human/Other/ALG6_ko.txt", quote="\"", comment.char="")
+ALG6_ko <- unique(ALG6_ko$V1)
+UGT_subs <- unique(c(UGT1_subs,UGT2_subs,ALG6_ko))
+length(which(UGT_subs %in% dp_domain$Protein))
+length(which(UGT_subs %in% ep_domain$Protein))
+```
+
+
+

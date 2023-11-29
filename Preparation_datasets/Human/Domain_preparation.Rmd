@@ -1,0 +1,336 @@
+---
+title: "Domain preparation human"
+output: html_notebook
+---
+```{r, include=FALSE} 
+library(dplyr)
+library(ggplot2)
+library(rlist)
+library(tidyr)
+library(ggpubr)
+library(stringr)
+library(seqinr)
+library(IRanges)
+library(GenomicRanges)
+library(data.table)
+library(plyr)
+library(multcompView)
+library(DescTools)
+library(rcompanion)
+library(ComplexHeatmap)
+library(gprofiler2)
+library(ggridges)
+library(ggsci)
+library(praise)
+library(bio3d)
+```
+
+Prepare domain dataset
+
+```{r, include=FALSE}
+load("Data/RData/Human/human_proteome.RData")
+human_proteome$length.protein <- nchar(human_proteome$Sequence)
+human_proteome$Sequence <- NULL
+domains <- read.csv("Data/Human/Domains/seqs.domains", header=FALSE, comment.char="#")
+colnames(domains) <- c("CATH.domain.ID","CATH.family.ID","Protein","match-id","score","boundaries","resolved","aligned-regions","cond-evalue","indp-evalue")
+domains <- subset(domains, Protein %in% human_proteome$Protein, select = c(1,2,3,6))
+e <- strsplit(domains$boundaries, split = ",")
+domains <- data.frame(CATH.domain.ID = rep(domains$CATH.domain.ID, sapply(e, length)), CATH.family.ID = rep(domains$CATH.family.ID, sapply(e, length)), 
+                      Protein = rep(domains$Protein, sapply(e, length)), boundaries = unlist(e))
+list_names <- strsplit(as.character(domains$boundaries), "-")
+res1 <- matrix(nrow = length(domains$boundaries), ncol = 1)
+res2 <- matrix(nrow = length(domains$boundaries), ncol = 1)
+for (i in 1:length(domains$boundaries)){
+  res1[i,] <- list_names[[i]][1]
+  res2[i,] <- list_names[[i]][2]
+}
+domains$begin.domain <- res1
+domains$end.domain <- res2
+domains$multi.domain <- "No"
+domains$multi.domain[which(domains$Protein %in% names(which(table(domains$Protein) > 1)))] <- "Yes"
+domains$multi.domain <- as.factor(domains$multi.domain)
+domains$begin.domain <- as.integer(domains$begin.domain)
+domains$end.domain <- as.integer(domains$end.domain)
+domains <- merge(domains, human_proteome)
+domains$length.domain <- domains$end.domain - domains$begin.domain
+```
+
+Calculate contact order using David Baker Script
+
+```{r, include=FALSE}
+load("Data/RData/Human/alpha_information_all_dssp.RData")
+path_or <- "Data/Human/OriginalPDBs/AF-"
+path_rep <- "Data/Human/RepairPDBs/AF-"
+alpha_information_all <- unique(subset(alpha_information_all, select = c(1,4)))
+domains <- subset(domains, Protein %in% alpha_information_all$Protein) #filter domains without a structure (40689 domains)
+domains$relative_co <- NA
+domains$absolute_co <- NA
+domains$pdb <- NA
+for (i in 3722:nrow(domains)){ 
+  print(i)
+  temp_prot <- domains$Protein[i]
+  temp_start <- as.integer(domains$begin.domain[i])
+  temp_end<- as.integer(domains$end.domain[i])
+  temp_pdb <- subset(alpha_information_all, Protein == temp_prot, select = 2)
+  if (length(temp_pdb$PDB) == 1){
+    re_file <-paste0(path_rep,temp_pdb$PDB,'-model_v1_Repair.pdb')
+    temp_pdb_repair <- read.pdb(re_file)
+    temp_pdb_repair_dom <- temp_pdb_repair$atom
+    temp_pdb_repair_alpha <- temp_pdb_repair$calpha
+    temp_pdb_repair_xyz <- temp_pdb_repair$xyz
+    temp_pdb_repair_alpha <- temp_pdb_repair_alpha[which((as.integer(temp_pdb_repair_dom$resno)) >= temp_start & (as.integer(temp_pdb_repair_dom$resno)) <= temp_end)]
+    temp_xyz <- which((as.integer(temp_pdb_repair_dom$resno)) >= temp_start & (as.integer(temp_pdb_repair_dom$resno)) <= temp_end)
+    temp_pdb_repair_xyz <- temp_pdb_repair_xyz[(3*temp_xyz[1] -2):(3*temp_xyz[length(temp_xyz)])]
+    temp_pdb_repair_dom <- temp_pdb_repair_dom[which((as.integer(temp_pdb_repair_dom$resno)) >= temp_start & (as.integer(temp_pdb_repair_dom$resno)) <= temp_end),]
+    temp_pdb_repair$atom <- temp_pdb_repair_dom
+    temp_pdb_repair$xyz <- temp_pdb_repair_xyz
+    temp_pdb_repair$calpha <- temp_pdb_repair_alpha
+    write.pdb(pdb = temp_pdb_repair, file = "Data/Human/Domains/temp_folder/temp.pdb")
+    arg1 <- "-a"
+    arg2 <- "-r"
+    pdb <- "Data/Human/Domains/temp_folder/temp.pdb"
+    cmd <- paste("perl", "Scripts/Human/contact_order_calculator.pl", arg1, arg2, pdb)
+    temp_co <- system(cmd, intern = TRUE)
+    domains$relative_co[i] <- temp_co[2]
+    domains$absolute_co[i] <- temp_co[1]
+    domains$pdb[i] <- temp_pdb$PDB
+  } else {
+    temp_pdb$prot_start <- NA
+    temp_pdb$prot_end <- NA
+    temp_pdb$prot_start_pdb <- NA
+    temp_pdb$prot_end_pdb <- NA
+    for (j in 1:nrow(temp_pdb)){
+      or_file <- paste0(path_or,temp_pdb$PDB[j],'-model_v1.pdb')
+      temp_pdb_original <- read.delim(or_file, header=FALSE)
+      temp_pdb_original <- temp_pdb_original[grep("DBREF", temp_pdb_original$V1), ]
+      list_names <- strsplit(temp_pdb_original, " ")[[1]]
+      list_names <- list_names[which(list_names != '')]
+      temp_pdb$prot_start[j] <- as.integer(list_names[9])
+      temp_pdb$prot_end[j] <- as.integer(list_names[10])
+      temp_pdb$prot_start_pdb[j] <- as.integer(list_names[4])
+      temp_pdb$prot_end_pdb[j] <- as.integer(list_names[5])
+    }
+    temp_pdb <- subset(temp_pdb,prot_start <= temp_start & prot_end >= temp_end)
+    temp_rest <- temp_pdb$prot_start[1] - temp_pdb$prot_start_pdb[1]
+    re_file <-paste0(path_rep,temp_pdb$PDB[1],'-model_v1_Repair.pdb')
+    temp_pdb_repair <- read.pdb(re_file)
+    temp_pdb_repair_dom <- temp_pdb_repair$atom
+    temp_pdb_repair_alpha <- temp_pdb_repair$calpha
+    temp_pdb_repair_xyz <- temp_pdb_repair$xyz
+    temp_pdb_repair_alpha <- temp_pdb_repair_alpha[which((as.integer(temp_pdb_repair_dom$resno) + temp_rest) >= temp_start & (as.integer(temp_pdb_repair_dom$resno) + temp_rest) <= temp_end)]
+    temp_xyz <- which((as.integer(temp_pdb_repair_dom$resno) + temp_rest) >= temp_start & (as.integer(temp_pdb_repair_dom$resno) + temp_rest) <= temp_end)
+    temp_pdb_repair_xyz <- temp_pdb_repair_xyz[(3*temp_xyz[1] -2):(3*temp_xyz[length(temp_xyz)])]
+    temp_pdb_repair_dom <- temp_pdb_repair_dom[which((as.integer(temp_pdb_repair_dom$resno) + temp_rest) >= temp_start & (as.integer(temp_pdb_repair_dom$resno) + temp_rest) <= temp_end),]
+    temp_pdb_repair$atom <- temp_pdb_repair_dom
+    temp_pdb_repair$xyz <- temp_pdb_repair_xyz
+    temp_pdb_repair$calpha <- temp_pdb_repair_alpha
+    write.pdb(pdb = temp_pdb_repair, file = "Data/Human/Domains/temp_folder/temp.pdb")
+    arg1 <- "-a"
+    arg2 <- "-r"
+    pdb <- "Data/Human/Domains/temp_folder/temp.pdb"
+    cmd <- paste("perl", "Scripts/Human/contact_order_calculator.pl", arg1, arg2, pdb)
+    temp_co <- system(cmd, intern = TRUE)
+    domains$relative_co[i] <- temp_co[2]
+    domains$absolute_co[i] <- temp_co[1]
+    domains$pdb[i] <- temp_pdb$PDB[1]
+  }
+}
+save(domains, file = "Data/RData/Human/domains_co_only.RData")
+list_names <- strsplit(as.character(domains$relative_co), ": ")
+res <- matrix(nrow = length(domains$relative_co), ncol = 1)
+for (i in 1:length(domains$relative_co)){
+  res[i,] <- list_names[[i]][2]
+}
+domains$relative_co <- as.numeric(res)
+list_names <- strsplit(as.character(domains$absolute_co), ": ")
+res <- matrix(nrow = length(domains$absolute_co), ncol = 1)
+for (i in 1:length(domains$absolute_co)){
+  res[i,] <- list_names[[i]][2]
+}
+domains$absolute_co <- as.numeric(res)
+domains <- subset(domains, !is.na(domains$relative_co))
+save(domains, file = "Data/RData/Human/domains_co_only.RData")
+```
+
+Include highest TANGO score in each domain as well as average TANGO score of domain and number of APRs
+
+```{r, include=FALSE}
+load("/Users/u0125634/Documents/PhD/Projects/Sub_location/Data/CATH_domains/structural_df.RData")
+load("/Users/u0125634/Documents/PhD/Projects/PTM_project/Data/RData/TANGO_PTM_HUMAN_15/FILTERED/tango_APRs.RData")
+load("Data/RData/Human/domains_co_only.RData")
+
+apr_sec <- unique(subset(master_df3_filtered, APRcount_tango != 0, select = c(3,44)))
+tango_APRs2 <- merge(tango_APRs2, apr_sec, all.x = T)
+
+domains <- domains[!duplicated(domains[,c('Protein','boundaries')]),]
+domains$CATH.class <- substring(domains$CATH.family.ID, 1, 5)
+p <- ggplot(domains, aes(x=CATH.class, y=relative_co)) +theme_bw() +  
+  geom_boxplot(notch=TRUE, outlier.shape = NA)
+p
+
+domains$total_tango <- NA
+domains$average_tango <- NA
+domains$max_APR <- NA
+domains$starAPR <- NA
+domains$endAPR <- NA
+domains$number.APR.100aa <- NA
+domains$Sec_APR <- NA
+domains$Sec_APR_max <- NA
+
+for (i in 1:nrow(domains)){
+  print(i)
+  temp_protein <- domains$Protein[i]
+  temp_start <- domains$begin.domain[i] - 3
+  temp_end <- domains$end.domain[i] + 3
+  temp_aprs <- subset(tango_APRs2, Protein == temp_protein & startAPR >= temp_start & endAPR <= temp_end)
+  if(nrow(temp_aprs) != 0){
+    domains$total_tango[i] <- sum(temp_aprs$TotalTANGO)
+    domains$average_tango[i] <- sum(temp_aprs$avgTANGO) / nrow(temp_aprs)
+    temp_id <- which.max(temp_aprs$avgTANGO)
+    domains$max_APR[i] <- temp_aprs$avgTANGO[temp_id]
+    domains$starAPR[i] <- temp_aprs$startAPR[temp_id]
+    domains$endAPR[i] <- temp_aprs$endAPR[temp_id]
+    domains$number.APR.100aa[i] <- nrow(temp_aprs)
+    domains$Sec_APR_max[i] <- temp_aprs$Sec_APR[temp_id]
+    domains$Sec_APR[i] <- paste(unique(temp_aprs$Sec_APR),collapse = '')
+  }
+}
+domains$max_APR[which(is.na(domains$max_APR))] <- 0
+domains$total_tango[which(is.na(domains$total_tango))] <- 0
+domains$average_tango[which(is.na(domains$average_tango))] <- 0
+domains$number.APR.100aa[which(is.na(domains$number.APR.100aa))] <- 0
+domains$number.APR.100aa <- domains$number.APR.100aa /  domains$length.domain * 100
+
+##ADD TMHMM INFO and also side of TMHMM 
+#Transmembrane domains from TMHMM
+load("/Users/u0125634/Documents/PhD/Projects/Cancer_Kobe/Data/UniProt/Human/human_proteome.RData")
+trans1.5000 <- read.delim("/Users/u0125634/Documents/PhD/Projects/PTM_project/Data/TMHMM/Human/trans1-5000.txt", header=FALSE)
+trans5001.10000 <- read.delim("/Users/u0125634/Documents/PhD/Projects/PTM_project/Data/TMHMM/Human/trans5001-10000.txt", header=FALSE)
+trans10001.15000 <- read.delim("/Users/u0125634/Documents/PhD/Projects/PTM_project/Data/TMHMM/Human/trans10001-15000.txt", header=FALSE)
+transend <- read.delim("/Users/u0125634/Documents/PhD/Projects/PTM_project/Data/TMHMM/Human/15001-end.txt", header=FALSE)
+TMHMM <- rbind(trans1.5000,trans5001.10000,trans10001.15000,transend)
+TMHMM <- subset(TMHMM, V5 != "PredHel=0" & V1 %in% human_proteome$Protein, select = c(1,6))
+colnames(TMHMM) <- c("Protein","Domains")
+TMHMM$Domains <- as.character(TMHMM$Domains)
+list_names <- strsplit(TMHMM$Domains, "=")
+res <- matrix(nrow = length(TMHMM$Domains), ncol = 1)
+for (i in 1:length(TMHMM$Domains)){
+  res[i,] <- list_names[[i]][2]
+}
+TMHMM$Domains <- res
+s <- strsplit(TMHMM$Domains, split = "i|o")
+TMHMM2 <- data.frame(Protein = rep(TMHMM$Protein, sapply(s, length)), Domains = unlist(s))
+TMHMM2$Domains <- as.character(TMHMM2$Domains)
+TMHMM2 <-subset(TMHMM2, Domains != '')
+list_names <- strsplit(as.character(TMHMM2$Domains), "-")
+res1 <- matrix(nrow = length(TMHMM2$Domains), ncol = 1)
+res2 <- matrix(nrow = length(TMHMM2$Domains), ncol = 1)
+for (i in 1:length(TMHMM2$Domains)){
+  res1[i,] <- list_names[[i]][1]
+  res2[i,] <- list_names[[i]][2]
+}
+TMHMM2$start <- res1
+TMHMM2$end <- res2
+g <- strsplit(TMHMM$Domains, split = "-")
+TMHMM3 <- data.frame(Protein = rep(TMHMM$Protein, sapply(g, length)), Domains = unlist(g))
+TMHMM3$Domains <- as.character(TMHMM3$Domains)
+
+domains$TMHMM <- "No"
+domains$TMHMM[which(domains$Protein %in% TMHMM2$Protein)] <- "Yes" #5120 proteins with at least one transmembrane domain
+domains$TMHMM_domain <- "No"
+domains_tm <- subset(domains, TMHMM == "Yes")
+rownames(domains_tm) <- NULL
+TMHMM2$start <- as.numeric(TMHMM2$start)
+TMHMM2$end <- as.numeric(TMHMM2$end)
+for (i in 1:nrow(domains_tm)){
+  print(i)
+  prot <- as.character(domains_tm$Protein[i])
+  starta <- domains_tm$begin.domain[i]
+  enda <- domains_tm$end.domain[i]
+  has_membrane <- subset(TMHMM2, Protein == prot & !((end < (starta + 5)) | (start > (enda - 5))))
+  domains_tm$TMHMM_domain[i] <- nrow(has_membrane)
+}
+domains$TMHMM_domain[which(domains$Protein %in% domains_tm$Protein & domains$begin.domain %in% domains_tm$begin.domain)] <- domains_tm$TMHMM_domain
+domains$TMHMM_domain[which(!domains$TMHMM_domain %in% c("No","0"))] <- "Yes"
+domains$TMHMM_domain[which(domains$TMHMM_domain == "0")] <- "No"
+
+domains$Description <- NA
+extra_info_membrane <- read.delim("~/Downloads/uniprot-proteome_UP000005640+reviewed_yes.tab")
+extra_info_membrane <- subset(extra_info_membrane, Topological.domain != '')
+s <- strsplit(extra_info_membrane$Topological.domain, split = ";  \\/evidence=.+?;", perl = T)
+extra_info_membrane2 <- data.frame(Protein = rep(extra_info_membrane$Entry, sapply(s, length)), Domains = unlist(s))
+list_names <- strsplit(as.character(extra_info_membrane2$Domains), ";  /evidence")
+res1 <- matrix(nrow = length(extra_info_membrane2$Domains), ncol = 1)
+for (i in 1:length(extra_info_membrane2$Domains)){
+  res1[i,] <- list_names[[i]][1]
+}
+extra_info_membrane2$Domains <- res1
+extra_info_membrane2$start <- str_match(extra_info_membrane2$Domains, "TOPO_DOM (.+)\\.\\.(.+);  \\/note=(.+)")[,2]
+extra_info_membrane2$end <- str_match(extra_info_membrane2$Domains, "TOPO_DOM (.+)\\.\\.(.+);  \\/note=(.+)")[,3]
+extra_info_membrane2$type <- str_match(extra_info_membrane2$Domains, "TOPO_DOM (.+)\\.\\.(.+);  \\/note=(.+)")[,4]
+
+
+domains$Description[which(domains$TMHMM == "Yes" & domains$TMHMM_domain == "No")] <- domains_tm2$Description
+domains$Description[which(domains$Description == "o")] <- "Extracellular"
+domains$Description[which(domains$Description == "i")] <- "Cytoplasmatic"
+domains$Description[which(is.na(domains$Description))] <- "No"
+
+#Include glycosylation info
+load("/Users/u0125634/Downloads/glyc.RData")
+glyc_enriched <- subset(glyc, Side2 %in% c("1_None","2_R","2_L","3_L"))
+glyc_other <- subset(glyc, !Side2 %in% c("1_None","2_R","2_L","3_L"))
+domains$glyc_enriched <- NA
+domains$glyc_other <- NA
+domains$glyc_APR <- NA
+domains$pos_glyc <- NA
+domains$type_glyc <- NA
+for (i in 1:nrow(domains)){
+  print(i)
+  temp_protein <- domains$Protein[i]
+  temp_start <- domains$begin.domain[i]
+  temp_end <- domains$end.domain[i]
+  temp_glyc1 <- subset(glyc_enriched, Protein == temp_protein & Position >= temp_start & Position <= temp_end)
+  temp_glyc2 <- subset(glyc_other, Protein == temp_protein & Position >= temp_start & Position <= temp_end)
+  domains$glyc_enriched[i] <- nrow(temp_glyc1)
+  domains$glyc_other[i] <- nrow(temp_glyc2)
+  domains$glyc_APR[i] <- max(as.numeric(temp_glyc1$avgScore))
+  domains$pos_glyc[i] <- min(as.numeric(temp_glyc1$Position))
+  domains$type_glyc[i] <- paste(temp_glyc1$Side2,collapse = ',')
+}
+domains$glyc_APR[which(domains$glyc_APR == "-Inf")] <- 0
+domains$pos_glyc[which(domains$pos_glyc == "Inf")] <- NA
+save(domains, file = "Data/CATH_domains/domains.RData")
+
+#Add cysteines (disulfide bridges information)
+load("/Users/u0125634/Documents/PhD/Projects/Sub_location/Data/CATH_domains/domains.RData")
+Disulfide_bridges <- read.delim("~/Documents/PhD/Projects/PTM_project_final/Data/Human/Other/Disulfide_bridges.tsv")
+s <- strsplit(Disulfide_bridges$Disulfide.bond, split = ";")
+Disulfide_bridges <- data.frame(Protein = rep(Disulfide_bridges$Entry, sapply(s, length)), Disulfide.bond = unlist(s))
+Disulfide_bridges <- Disulfide_bridges[grep("DISULFID", Disulfide_bridges$Disulfide.bond), ]
+Disulfide_bridges$Disulfide.bond <- gsub(" ", "", Disulfide_bridges$Disulfide.bond, fixed = TRUE)
+Disulfide_bridges$Disulfide.bond <- gsub("DISULFID", "", Disulfide_bridges$Disulfide.bond, fixed = TRUE)
+Disulfide_bridges2 <- Disulfide_bridges[grep("\\..", Disulfide_bridges$Disulfide.bond), ]
+list_names <- strsplit(as.character(Disulfide_bridges2$Disulfide.bond), "\\..")
+res1 <- matrix(nrow = length(Disulfide_bridges2$Disulfide.bond), ncol = 1)
+res2 <- matrix(nrow = length(Disulfide_bridges2$Disulfide.bond), ncol = 1)
+for (i in 1:length(Disulfide_bridges2$Disulfide.bond)){
+  res1[i,] <- list_names[[i]][1]
+  res2[i,] <- list_names[[i]][2]
+}
+Disulfide_bridges2$start <- res1
+Disulfide_bridges2$end <- res2
+Disulfide_bridges2$start <- as.numeric(Disulfide_bridges2$start)
+Disulfide_bridges2$end <- as.numeric(Disulfide_bridges2$end)
+Disulfide_bridges2 <- subset(Disulfide_bridges2, !is.na(start))
+save(Disulfide_bridges2, file = "Data/RData/Human/Disulfide_bridges2.RData")
+domains$number.disulfide.100aa <- NA
+for (i in 1:nrow(domains)){
+  print(i)
+  temp_protein <- domains$Protein[i]
+  temp_start <- domains$begin.domain[i]
+  temp_end <- domains$end.domain[i]
+  temp_dis1 <- subset(Disulfide_bridges2, Protein == temp_protein & start >= temp_start & end <= temp_end)
+  domains$number.disulfide.100aa[i] <- nrow(temp_dis1) / domains$length.domain[i] * 100
+}
+save(domains, file = "/Users/u0125634/Documents/PhD/Projects/Sub_location/Data/CATH_domains/domains.RData")
+```

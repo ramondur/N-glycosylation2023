@@ -1,0 +1,390 @@
+---
+title: "Preparation mouse dataset for PTM project"
+output: html_notebook
+---
+```{r, include=FALSE} 
+library(dplyr)
+library(ggplot2)
+library(rlist)
+library(tidyr)
+library(ggpubr)
+library(stringr)
+library(seqinr)
+library(IRanges)
+library(GenomicRanges)
+library(data.table)
+```
+
+The mouse (Mus musculus) proteome was obtained from UniProtKB/Swiss-Prot database (reference proteome UP000000589; release 2022_02). Aggregation prone regions (APRs) were predicted computationally using TANGO at physiological conditions (pH at 7.5, temperature at 298 K, protein concentration at 1 mM and ionic strength at 0.15 M). 
+
+```{r, include=FALSE}
+tango_APRs <- read.delim("Data/Mouse/TANGO_output/PSX_tangoresidue.out", header=TRUE)
+colnames(tango_APRs) <- c("Protein","Position","Residue","tango_Score","length")
+tango_APRs$length <- NULL
+list_names <- strsplit(as.character(tango_APRs$Protein), "\\|")
+res <- matrix(nrow = length(tango_APRs$Protein), ncol = 1)
+for (i in 1:length(tango_APRs$Protein)){
+  res[i,] <- list_names[[i]][2]
+}
+tango_APRs$Protein <- res
+```
+
+The dataset contains 5783 proteins, after excluding sequences with nonstandard amino acids (e.g. selenocysteine), sequences with <25 amino acids and those with >10,000 residues and after filtering at 90% sequence identity using the CD-hit algorithm.
+
+```{r, include=FALSE}
+#cd-hit using the web server with default options
+names90 <- read.delim("Data/Mouse/UniProt/mouse_90.fasta", header=FALSE)
+list_names <- strsplit(as.character(names90$V1), "\\|")
+res <- matrix(nrow = length(names90$V1), ncol = 1)
+for (i in 1:length(names90$V1)){
+  res[i,] <- list_names[[i]][2]
+}
+names90$V1 <- res
+names90 <- unique(names90)
+tango_APRs <- subset(tango_APRs, Protein %in% names90$V1) 
+#Remove proteins with less than 25 aa and more that 10,000 aa and define APRs score >10
+tango_APRs$length <- 1
+proteinsum <- aggregate(length ~ Protein, data=tango_APRs, FUN="sum") 
+colnames(proteinsum) <- c("Protein","protein_length")
+tango_APRs <- merge(tango_APRs,proteinsum, by="Protein")
+length(which(proteinsum$protein_length < 25))
+shorties <- tango_APRs[tango_APRs$Protein %in% proteinsum$Protein[proteinsum$protein_length<25],]
+master_df <- tango_APRs[!(tango_APRs$Protein %in% shorties$Protein),]
+```
+
+Signal peptides and transmembrane domains were identified using deepTMHMM. These were later removed from the analyses to avoid biases.
+
+```{r, include=FALSE}
+#First save mouse proteome file
+mouse_proteome <- aggregate (Residue ~ Protein, data=master_df, FUN="paste",collapse = "")
+colnames(mouse_proteome) <- c("Protein","Sequence")
+save(mouse_proteome, file = "Data/RData/Mouse/mouse_proteome.RData")
+#Create files for SignalP and TMHMM
+write.fasta(as.list(mouse_proteome$Sequence[1:5000]), mouse_proteome$Protein[1:5000], "Data/Mouse/UniProt/1-5000.fa", open = "w", nbchar = 60, as.string = FALSE)
+write.fasta(as.list(mouse_proteome$Sequence[5001:10000]), mouse_proteome$Protein[5001:10000], "Data/Mouse/UniProt/5001-10000.fa", open = "w", nbchar = 60, as.string = FALSE)
+write.fasta(as.list(mouse_proteome$Sequence[10001:nrow(mouse_proteome)]), mouse_proteome$Protein[10001:nrow(mouse_proteome)], "Data/Mouse/UniProt/10001-end.fa", open = "w", nbchar = 60, as.string = FALSE)
+#Transmembrane domains , topology and signal peptides from deepTMHMM (deepTMHMM using biolib webserver)
+trans1.5000 <- read.table("Data/Mouse/TMHMM/TMRs_1-5000.gff3", sep=";", quote="\"")
+trans5001.10000 <- read.table("Data/Mouse/TMHMM/TMRs_5001-10000.gff3", sep=";", quote="\"")
+transend <- read.table("Data/Mouse/TMHMM/TMRs_10001-end.gff3", sep=";", quote="\"")
+TMHMM <- rbind(trans1.5000,trans5001.10000,transend)
+TMHMM <- subset(TMHMM, V1 != "//")
+TMHMM <- cbind(TMHMM, read.table(text = TMHMM$V1, header = FALSE, sep = "\t"))
+TMHMM <- subset(TMHMM, select = c(2:5))
+colnames(TMHMM) <- c("Protein","Topology","Start","End")
+TMHMM <- subset(TMHMM, Protein %in% mouse_proteome$Protein)
+dt1 <- as.data.table(TMHMM)
+dt2 <- as.data.table(master_df)
+gr1 = GRanges(Rle(dt1$Protein), IRanges(as.numeric(dt1$Start), as.numeric(dt1$End)))
+gr2 = GRanges(Rle(dt2$Protein), IRanges(as.numeric(dt2$Position),as.numeric(dt2$Position)))
+zone.ind <- findOverlaps(gr2, gr1, select="arbitrary")
+dt2$Topology <- dt1$Topology[zone.ind]
+master_df <- as.data.frame(dt2)
+rm(dt2,dt1)
+gc()
+save(master_df, file = "Data/RData/Mouse/all_tango_res_filtered.RData")
+```
+
+In this study, APRs are defined as continuous segments between 5 and 15 amino acids in length, each with an aggregation score of at least 10. Gatekeeper positions (GKPs) are defined as the next three residues immediately downstream and upstream of APRs. All other residues are defined as distal regions.
+
+```{r, include=FALSE}
+#Annotate TANGO categories and add avgTANGO per APR and maxTANGO protein
+load("Data/RData/Mouse/all_tango_res_filtered.RData")
+master_df$APRdef_tango <- "No"
+master_df$APRdef_tango[which(master_df$tango_Score > 10)] <- "APR" 
+annotateDF <- function(prepare_annotation, a,b,c,d) {
+  prepare_annotation$APRdef2_tango <- gsub(a, b, prepare_annotation$APRdef2_tango)
+  prepare_annotation$APRdef2_tango <- gsub(c, d, prepare_annotation$APRdef2_tango)
+  return(prepare_annotation)
+}
+master_df3 <- master_df
+master_df3$APRdef2_tango <-as.numeric(as.factor(master_df3$APRdef_tango))
+master_df3$APRdef2_tango[which(master_df3$APRdef2_tango == 2)] <- 0
+prepare_annotation <- aggregate (APRdef2_tango ~ Protein, data=master_df3, FUN="paste",collapse = "")
+prepare_annotation2 <- annotateDF(prepare_annotation,"01","21","10","12") #GK_1
+prepare_annotation2 <- annotateDF(prepare_annotation2,"02","32","20","23") #GK_2
+prepare_annotation2 <- annotateDF(prepare_annotation2,"03","43","30","34") #GK_3
+prepare_annotation2 <- paste(prepare_annotation2$APRdef2_tango, collapse="")
+prepare_annotation2 <- unlist(strsplit(prepare_annotation2,""))
+master_df3$APRdef2_tango <- prepare_annotation2
+master_df3$APRdef_tango[which(master_df3$APRdef2_tango == "0")] <- "Distal region"
+master_df3$APRdef_tango[which(master_df3$APRdef2_tango == "2")] <- "GK_1"
+master_df3$APRdef_tango[which(master_df3$APRdef2_tango == "3")] <- "GK_2"
+master_df3$APRdef_tango[which(master_df3$APRdef2_tango == "4")] <- "GK_3"
+master_df3$Protein <- as.factor(master_df3$Protein)
+prepare_annotation3 <- annotateDF(prepare_annotation,"01","A1","10","1D") #GK_1
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0A","BA","D0","DE") #GK_2
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0B","CB","E0","EF") #GK_3
+prepare_annotation3 <- paste(prepare_annotation3$APRdef2_tango, collapse="")
+prepare_annotation3 <- unlist(strsplit(prepare_annotation3,""))
+master_df3$Side <- prepare_annotation3
+master_df3$Side[which(master_df3$Side %in% c("0","1"))] <- "None"
+master_df3$Side[which(master_df3$Side %in% c("A","B","C"))] <- "N_ter"
+master_df3$Side[which(master_df3$Side %in% c("D","E","F"))] <- "C_ter"
+#Define TANGO APRs ids
+tango_APRs <- subset(master_df3, APRdef_tango != "Distal region")
+j <- 1
+tango_APRs$APRcount_tango <- 0
+tango_APRs$APRcount_tango[1] <- 1
+for (i in 2:length(tango_APRs$Protein)){
+  if (tango_APRs$Protein[i] != tango_APRs$Protein[i-1] | tango_APRs$Position[i] != (tango_APRs$Position[i-1]+1)){
+    j <- j + 1
+    tango_APRs$APRcount_tango[i] <- j 
+  }
+  else if (tango_APRs$Side[i-1] == "C_ter" & tango_APRs$APRdef2_tango[i-1] == 4) {
+    j <- j + 1
+    tango_APRs$APRcount_tango[i] <- j 
+  }
+  else if (tango_APRs$Side[i-1] == "C_ter" & tango_APRs$APRdef2_tango[i-1] != 4 & tango_APRs$Side[i] != "C_ter") {
+    j <- j + 1
+    tango_APRs$APRcount_tango[i] <- j 
+  }
+  else{
+    tango_APRs$APRcount_tango[i] <- j 
+  }
+}
+tango_APRs2 <- subset(tango_APRs, select = c(1,2,11))
+master_df3 <- merge(master_df3,tango_APRs2, by=c("Protein","Position"),all = TRUE)
+master_df3$APRcount_tango[which(is.na(master_df3$APRcount_tango))] <- 0
+master_df3$APRdef_tango[which(master_df3$APRcount_tango == 0)] <- "No"
+save(master_df3, file = "Data/RData/Mouse/all_tango_res_annotated.RData")
+#Summarize TANGO information
+load("Data/RData/Mouse/all_tango_res_annotated.RData")
+onlyapr_tango <- subset(master_df3, master_df3$APRdef_tango=="APR")
+tango_APRs <- aggregate (Residue ~ APRcount_tango, data=onlyapr_tango, FUN="paste",collapse = "")
+colnames(tango_APRs) <- c("APRcount_tango","APR")
+TotalTANGO <- aggregate (tango_Score ~ APRcount_tango, data=onlyapr_tango, FUN="sum")
+colnames(TotalTANGO) <- c("APRcount_tango","TotalTANGO")
+lengthAPR <- aggregate (length ~ APRcount_tango, data=onlyapr_tango, FUN="sum")
+colnames(lengthAPR) <- c("APRcount_tango","lengthAPR")
+startAPR <- aggregate (Position ~ APRcount_tango, data=onlyapr_tango, FUN="min")
+colnames(startAPR) <- c("APRcount_tango","startAPR")
+endAPR <- aggregate (Position ~ APRcount_tango, data=onlyapr_tango, FUN="max")
+colnames(endAPR) <- c("APRcount_tango","endAPR")
+proteins_apr <- unique(subset(onlyapr_tango, select = c(1,11)))
+topology_apr <- aggregate (Topology ~ APRcount_tango, data=onlyapr_tango, FUN="unique")
+tango_APRs <- Reduce(function(x, y) merge(x, y, all=TRUE), list(proteins_apr,tango_APRs,TotalTANGO,lengthAPR,startAPR,endAPR,topology_apr))
+tango_APRs$avgTANGO <- tango_APRs$TotalTANGO / tango_APRs$lengthAPR
+tango_APRs2 <- subset(tango_APRs, lengthAPR > 4 & lengthAPR < 16 & Topology %in% c("outside","inside")) #From 32478 to 24593
+onlyapr_tango <- onlyapr_tango[which(onlyapr_tango$APRcount_tango %in% tango_APRs2$APRcount_tango),]
+len_APR <- aggregate (length ~ APRcount_tango, data=onlyapr_tango, FUN="sum")
+colnames(len_APR)[2] <- "APR_length"
+onlyapr_tango$length <- NULL
+onlyapr_tango <- merge(onlyapr_tango,len_APR)
+master_df3$APRcount_tango[which(!master_df3$APRcount_tango %in% onlyapr_tango$APRcount_tango)] <- 0
+master_df3$APRdef_tango[which(master_df3$APRcount_tango == 0)] <- "Distal region"
+master_df3$APRdef2_tango[which(master_df3$APRcount_tango == 0)] <- 0
+master_df3$Side[which(master_df3$APRcount_tango == 0)] <- "None"
+total_scoreAPR <- aggregate (tango_Score ~ APRcount_tango, data=onlyapr_tango, sum)
+colnames(total_scoreAPR) <- c("APRcount_tango","TotalScore")
+onlyapr_tango <- merge(onlyapr_tango,total_scoreAPR,by="APRcount_tango")
+onlyapr_tango$avgScore <- onlyapr_tango$TotalScore / onlyapr_tango$APR_length
+maxAPR_Protein <- aggregate (avgScore ~ Protein, data=onlyapr_tango, max)
+colnames(maxAPR_Protein) <- c("Protein","maxProtscore")
+onlyapr_tango <- merge(onlyapr_tango,maxAPR_Protein,by="Protein")
+temp <- unique(subset(onlyapr_tango, select = c(1,2,11,13)))
+temp2 <- unique(subset(onlyapr_tango, select = c(1,14)))
+master_df3 <- merge(master_df3,temp,by = c("Protein","APRcount_tango"), all.x = TRUE)
+master_df3 <- merge(master_df3,temp2,by = c("Protein"), all.x = TRUE)
+master_df3 <- master_df3[order(master_df3$Protein, master_df3$Position),]
+rownames(master_df3) <- NULL
+master_df3$maxProtscore[which(is.na(master_df3$maxProtscore))] <- 0
+master_df3$avgScore[which(is.na(master_df3$avgScore))] <- 0
+master_df3$APR_length[which(is.na(master_df3$APR_length))] <- 0
+save(master_df3, file = "Data/RData/Mouse/master_df.RData")
+save(tango_APRs, file = "Data/RData/Mouse/tango_APRs_ALL.RData")
+save(tango_APRs2, file = "Data/RData/Mouse/tango_APRs.RData")
+```
+
+Since TANGO calculations of the aggregation propensity incorporate the effects of GKs, we also included a second step in the calculation, in which we recalculate the TANGO score of the isolated APRs flanked by Alanines. We called the resulting aggregation propensity score of APRs without the mitigating effect of the flanking GKs the “PureTANGO” score.
+
+```{r, include=FALSE}
+load("Data/RData/Mouse/master_df.RData")
+pure_tango <- subset(master_df3, master_df3$APRdef_tango=="APR")
+pure_tango <- aggregate (Residue ~ APRcount_tango, data=pure_tango, FUN="paste",collapse = "")
+pure_tango$Residue <- paste0("A",pure_tango$Residue)
+pure_tango$Residue <- paste0(pure_tango$Residue,"A")
+write.fasta(as.list(pure_tango$Residue), pure_tango$APRcount_tango, "Data/Mouse/TANGO_output/Pure_tango/pure_tango.fa", open = "w", nbchar = 60, as.string = FALSE)
+pure_tango <- read.delim("Data/Mouse/TANGO_output/Pure_tango/PSX_globaltotal.out", header=FALSE)
+pure_tango <- subset(pure_tango, select = c(1,3))
+colnames(pure_tango) <- c("APRcount_tango","pure_Tango")
+master_df3 <- merge(master_df3,pure_tango,all.x = TRUE)
+master_df3$pure_Tango <- master_df3$pure_Tango / master_df3$APR_length
+master_df3$pure_Tango[which(is.na(master_df3$pure_Tango))] <- 0
+master_df3 <- master_df3[order(master_df3$Protein, master_df3$Position),]
+rownames(master_df3) <- NULL
+save(master_df3, file = "Data/RData/Mouse/master_df.RData")
+```
+
+Information on protein subcellular location was extracted from UniProt.
+
+```{r, include=FALSE}
+uniprot.proteome <- read.delim("Data/Mouse/UniProt/mouse_proteome_info.tsv")
+uniprot.proteome <- subset(uniprot.proteome, select = c(1,8))
+colnames(uniprot.proteome) <- c("Protein","Sub_loc")
+master_df3 <- merge(master_df3,uniprot.proteome, all.x = TRUE)
+master_df3$Nucleus <- "No"
+master_df3$Nucleus[which(grepl("ucleus", master_df3$Sub_loc, fixed = TRUE))] <- "Yes"
+master_df3$Cytoplasm <- "No"
+master_df3$Cytoplasm[which(grepl("ytoplasm", master_df3$Sub_loc, fixed = TRUE))] <- "Yes"
+master_df3$Secreted <- "No"
+master_df3$Secreted[which(grepl("ecreted", master_df3$Sub_loc, fixed = TRUE))] <- "Yes"
+master_df3$Membrane <- "No"
+master_df3$Membrane[which(grepl("ell membrane", master_df3$Sub_loc, fixed = TRUE) | grepl("ell projection", master_df3$Sub_loc, fixed = TRUE))] <- "Yes"
+master_df3$Mitochondrion <- "No"
+master_df3$Mitochondrion[which(grepl("itochondrion", master_df3$Sub_loc, fixed = TRUE))] <- "Yes"
+master_df3$Endoplasmic_reticulum <- "No"
+master_df3$Endoplasmic_reticulum[which(grepl("eticulum", master_df3$Sub_loc, fixed = TRUE))] <- "Yes"
+master_df3$Golgi <- "No"
+master_df3$Golgi[which(grepl("olgi", master_df3$Sub_loc, fixed = TRUE))] <- "Yes"
+master_df3$Lysosome <- "No"
+master_df3$Lysosome[which(grepl("ysosome", master_df3$Sub_loc, fixed = TRUE))] <- "Yes"
+save(master_df3, file = "Data/RData/Mouse/master_df.RData")
+```
+
+ANALYSIS
+
+```{r, include=FALSE}
+load("Data/RData/Mouse/master_df.RData")
+load("Data/dbPTM/all_PTM_data.RData")
+master_df3_filtered <- subset(master_df3, Topology %in% c("inside","outside"))
+#PTM ASN predictor based on sequon
+all_res <- paste(master_df3_filtered$Residue, collapse = '')
+all_res <- gsub('N[^P][ST]', '210', all_res)
+all_res <- unlist(strsplit(all_res,""))
+master_df3_filtered$glyc <- all_res 
+master_df3_filtered$loc <- "No"
+master_df3_filtered$loc[which((master_df3_filtered$Nucleus == "No" & master_df3_filtered$Cytoplasm == "No" & master_df3_filtered$Mitochondrion == "No") &
+                          (master_df3_filtered$Secreted == "Yes" | master_df3_filtered$Membrane == "Yes" | master_df3_filtered$Endoplasmic_reticulum == "Yes" | master_df3_filtered$Golgi == "Yes" | master_df3_filtered$Lysosome == "Yes") & master_df3_filtered$Topology == "outside")] <- "Extra"
+master_df3_filtered$loc[which((master_df3_filtered$Nucleus == "Yes" | master_df3_filtered$Cytoplasm == "Yes" | master_df3_filtered$Mitochondrion == "Yes") &
+                          (master_df3_filtered$Secreted == "No" & master_df3_filtered$Membrane == "No" & master_df3_filtered$Endoplasmic_reticulum == "No" & master_df3_filtered$Golgi == "No" & master_df3_filtered$Lysosome == "No") & master_df3_filtered$Topology == "inside")] <- "Intra"
+nlinked <- subset(PTMs_df, Type2 == "N-linked Glycosylation_N" & names == "MOUSE", select = c(1,2,4,6))
+colnames(nlinked)[3] <- "Residue"
+master_df3_filtered$loc[which(master_df3_filtered$Protein %in% nlinked$Protein)] <- "Extra"
+master_df3_filtered <- merge(master_df3_filtered, nlinked, by=c("Protein","Position","Residue"), all.x = TRUE)
+master_df3_filtered$glyc[which(master_df3_filtered$glyc == 0)] <- as.character(master_df3_filtered$Residue[which(master_df3_filtered$glyc == 0)])
+master_df3_filtered$glyc[which(master_df3_filtered$glyc == 1)] <- as.character(master_df3_filtered$Residue[which(master_df3_filtered$glyc == 1)])
+master_df3_filtered$glyc[which(master_df3_filtered$glyc == 2)] <- "Sequon"
+master_df3_filtered$glyc[which(master_df3_filtered$Type2 == "N-linked Glycosylation_N")] <- "N-linked Glycosylation_N"
+
+types <- c("Sequon.Intra","Sequon.Extra")
+bio_mouse = matrix(numeric(length(types)*9), nrow = length(types), ncol = 8)
+colnames(bio_mouse) <- c("Distal region","FR3 N-ter","FR2 N-ter","FR1 N-ter","APR","FR1 C-ter","FR2 C-ter","FR3 C-ter")
+rownames(bio_mouse) <- types
+for (i in 1:length(types)){
+  print(i)
+  temp_loc <- strsplit(types[i], "\\.")[[1]][2]
+  temp_res <- strsplit(types[i], "\\.")[[1]][1]
+  asp <- subset(master_df3_filtered, Residue == "N" & loc == temp_loc)
+  glyc <- subset(master_df3_filtered, glyc == temp_res & loc == temp_loc)
+  dis <- nrow(subset(glyc, APRdef2_tango== 0)) / nrow(subset(asp, APRdef2_tango == 0)) * 100
+  apr <- nrow(subset(glyc, APRdef2_tango == 1 )) / nrow(subset(asp, APRdef2_tango == 1)) * 100
+  gk_l <- nrow(subset(glyc, APRdef2_tango == 2 & Side == "N_ter")) / nrow(subset(asp, APRdef2_tango == 2 & Side == "N_ter")) * 100
+  gk_r <- nrow(subset(glyc, APRdef2_tango == 2 & Side == "C_ter")) / nrow(subset(asp, APRdef2_tango == 2  & Side == "C_ter")) * 100
+  fl1_l <- nrow(subset(glyc, APRdef2_tango == 3  & Side == "N_ter" )) / nrow(subset(asp, APRdef2_tango == 3  & Side == "N_ter")) * 100
+  fl1_r <- nrow(subset(glyc, APRdef2_tango == 3 & Side == "C_ter" )) / nrow(subset(asp, APRdef2_tango == 3  & Side == "C_ter")) * 100
+  fl2_l <- nrow(subset(glyc, APRdef2_tango  == 4  & Side == "N_ter" )) / nrow(subset(asp, APRdef2_tango  == 4  & Side == "N_ter")) * 100
+  fl2_r <- nrow(subset(glyc, APRdef2_tango  == 4 & Side == "C_ter" )) / nrow(subset(asp, APRdef2_tango  == 4  & Side == "C_ter")) * 100
+  all <- nrow(subset(glyc)) / nrow(subset(asp)) * 100
+  dat2 <- c(dis,fl2_l,fl1_l,gk_l,apr,gk_r,fl1_r,fl2_r,all)
+  bio_mouse[i,] <- dat2[1:8] / dat2[9]
+  print(dat2[1:8] / dat2[9])
+  print(nrow(glyc))
+}
+save(bio_mouse, file = "Data/RData/Mouse/bio_mouse.RData")
+#Statistics for accessibility 
+type <- "Sequon.Extra"
+temp_loc <- strsplit(type, "\\.")[[1]][2]
+temp_res <- strsplit(type, "\\.")[[1]][1]
+glyc <- subset(master_df3_filtered, loc == temp_loc & Residue == "N")
+glyc$PTM <- "No"
+glyc$PTM[which(glyc$glyc == temp_res)] <- "Yes"
+glyc$APRdef_tango <- paste0(glyc$APRdef_tango,"_",glyc$Side)
+glyc_df <- as.matrix(table(glyc$APRdef_tango,glyc$PTM))
+tot_prot <- c(sum(glyc_df[,1]),sum(glyc_df[,2]))
+glyc_df <- rbind(glyc_df, tot_prot)
+#Chi-square test of association  #Website: biostathandbook.com/chiind.html
+PT = pairwiseNominalIndependence(glyc_df,
+                                 compare = "row",
+                                 fisher  = TRUE,
+                                 gtest   = FALSE,
+                                 chisq   = FALSE,
+                                 method  = "fdr", 
+                                 digits  = 3)
+PT <- subset(PT, grepl("tot_prot", PT$Comparison, fixed = TRUE))
+PT <- PT[order(PT$p.Fisher),]
+rownames(PT) <- NULL 
+PT$p.adj.Fisher <- PT$p.Fisher * (nrow(PT) / as.numeric(rownames(PT)))
+PT$final <- NA
+PT$final[which(PT$p.adj.Fisher < 0.05)] <- "*"
+PT$final[which(PT$p.adj.Fisher < 0.01)] <- "**"
+PT$final[which(PT$p.adj.Fisher < 0.001)] <- "***"
+PT
+```
+
+STRESSES MS
+
+```{r, include=FALSE}
+master_df3_filtered$Side2 <- paste0(master_df3_filtered$APRdef2_tango,"_",master_df3_filtered$Side)
+proteins_seq_ep <- unique(subset(master_df3_filtered, Side2 %in% c("1_None","2_N_ter","3_N_ter") & glyc %in% c("N-linked Glycosylation_N","Sequon") & loc == "Extra", select = 1))
+proteins_seq_nep <- unique(subset(master_df3_filtered, glyc %in% c("N-linked Glycosylation_N","Sequon") & loc == "Extra" & !Protein %in% as.character(proteins_seq_ep$Protein),  select = 1))
+proteins_other <- unique(subset(master_df3_filtered, loc == "Extra" & !Protein %in% c(as.character(proteins_seq_ep$Protein), as.character(proteins_seq_nep$Protein)),  select = 1))
+proteins_intra <- unique(subset(master_df3_filtered, loc == "Intra" & !Protein %in% c(as.character(proteins_seq_ep$Protein),as.character(proteins_seq_nep$Protein), as.character(proteins_other$Protein)),  select = 1))
+stresses_insoluble <- read.delim("Data/Mouse/Mouse_stresses/stresses_insoluble.tab")
+stresses_insoluble1 <- subset(stresses_insoluble, Protein %in% proteins_seq_ep$Protein)
+stresses_insoluble2 <- subset(stresses_insoluble, Protein %in% proteins_seq_nep$Protein)
+stresses_insoluble3 <- subset(stresses_insoluble, Protein %in% proteins_other$Protein)
+stresses_insoluble4 <- subset(stresses_insoluble, Protein %in% proteins_intra$Protein)
+stresses_soluble <- read.delim("Data/Mouse/Mouse_stresses/stresses_soluble.tab")
+stresses_soluble1 <- subset(stresses_soluble, Protein %in% proteins_seq_ep$Protein)
+stresses_soluble2 <- subset(stresses_soluble, Protein %in% proteins_seq_nep$Protein)
+stresses_soluble3 <- subset(stresses_soluble, Protein %in% proteins_other$Protein)
+stresses_soluble4 <- subset(stresses_soluble, Protein %in% proteins_intra$Protein)
+er_prots <- read.delim("Data/Mouse/Mouse_stresses/ER_stress.tab")
+er_all1 <- subset(er_prots, Entry %in% proteins_seq_ep$Protein)
+er_all2 <- subset(er_prots, Entry %in% proteins_seq_nep$Protein)
+er_all3 <- subset(er_prots, Entry %in% proteins_other$Protein)
+er_all4 <- subset(er_prots, Entry %in% proteins_intra$Protein)
+hsp70_prots <- read.delim("Data/Mouse/Mouse_stresses/hsp70.tab")
+hsp70_1 <- subset(hsp70_prots, Entry %in% proteins_seq_ep$Protein)
+hsp70_2 <- subset(hsp70_prots, Entry %in% proteins_seq_nep$Protein)
+hsp70_3 <- subset(hsp70_prots, Entry %in% proteins_other$Protein)
+hsp70_4 <- subset(hsp70_prots, Entry %in% proteins_intra$Protein)
+hsp90_prots <- read.delim("Data/Mouse/Mouse_stresses/hsp90.tab")
+hsp90_1 <- subset(hsp90_prots, Entry %in% proteins_seq_ep$Protein)
+hsp90_2 <- subset(hsp90_prots, Entry %in% proteins_seq_nep$Protein)
+hsp90_3 <- subset(hsp90_prots, Entry %in% proteins_other$Protein)
+hsp90_4 <- subset(hsp90_prots, Entry %in% proteins_intra$Protein)
+OS_prots <- read.delim("Data/Mouse/Mouse_stresses/oxidative_stress.tab")
+OS_1 <- subset(OS_prots, Entry %in% proteins_seq_ep$Protein)
+OS_2 <- subset(OS_prots, Entry %in% proteins_seq_nep$Protein)
+OS_3 <- subset(OS_prots, Entry %in% proteins_other$Protein)
+OS_4 <- subset(OS_prots, Entry %in% proteins_intra$Protein)
+prota_prots <- read.delim("Data/Mouse/Mouse_stresses/proteosome_inhibition.tab")
+prota_1 <- subset(prota_prots, Entry %in% proteins_seq_ep$Protein)
+prota_2 <- subset(prota_prots, Entry %in% proteins_seq_nep$Protein)
+prota_3 <- subset(prota_prots, Entry %in% proteins_other$Protein)
+prota_4 <- subset(prota_prots, Entry %in% proteins_intra$Protein)
+```
+
+TME binders
+
+```{r, include=FALSE}
+T_ctrBinder <- read.csv("Data/Mouse/TEM_binders/T_ctrBinder.csv")
+T_tuniBinder <- read.csv("Data/Mouse/TEM_binders/T_tuniBinder.csv")
+T_tuniBinder2<- T_tuniBinder[which(! T_tuniBinder$proteinID %in% T_ctrBinder$proteinID),]
+tu1 <- subset(T_tuniBinder, proteinID %in% proteins_seq_ep$Protein)
+tu2 <- subset(T_tuniBinder, proteinID %in% proteins_seq_nep$Protein)
+tu3 <- subset(T_tuniBinder, proteinID %in% proteins_other$Protein)
+tu4 <- subset(T_tuniBinder, proteinID %in% proteins_intra$Protein)
+con1 <- subset(T_ctrBinder, proteinID %in% proteins_seq_ep$Protein)
+con2 <- subset(T_ctrBinder, proteinID %in% proteins_seq_nep$Protein)
+con3 <- subset(T_ctrBinder, proteinID %in% proteins_other$Protein)
+con4 <- subset(T_ctrBinder, proteinID %in% proteins_intra$Protein)
+
+tu11 <- subset(T_tuniBinder2, proteinID %in% proteins_seq_ep$Protein)
+tu22 <- subset(T_tuniBinder2, proteinID %in% proteins_seq_nep$Protein)
+tu33 <- subset(T_tuniBinder2, proteinID %in% proteins_other$Protein)
+tu44 <- subset(T_tuniBinder2, proteinID %in% proteins_intra$Protein)
+```
+

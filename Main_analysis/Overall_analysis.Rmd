@@ -1,0 +1,1143 @@
+---
+title: "Overall PTM analysis human and other species"
+output: html_notebook
+---
+```{r, include=FALSE} 
+library(dplyr)
+library(ggplot2)
+library(rlist)
+library(tidyr)
+library(ggpubr)
+library(stringr)
+library(seqinr)
+library(IRanges)
+library(GenomicRanges)
+library(data.table)
+library(plyr)
+library(multcompView)
+library(DescTools)
+library(rcompanion)
+library(ComplexHeatmap)
+library(gprofiler2)
+library(ggridges)
+library(ggsci)
+library(praise)
+library(fgsea)
+```
+
+In order to obtain a first global estimate on the prevalence and enrichment of post-translational modifications (PTMs) in human aggregation prone regions (APRs), the complete human proteome was scanned with a widely used protein aggregation predictor, TANGO. This identified a total of 84,573 APRs (score >10 and length 5-15 residues). The rest of positions were annotated accordingly as flanking regions (FRs) and distal regions. Next, experimentally annotated human PTM-sites were collected from dbPTM and mapped to the dataset. In addition, O-GlcNAc sites were retrived from the O-GlcNAcAtlas. Only PTM-types with enough data to perform accurate statistical (at least 1,200 sites) analysis were retained, which resulted in 17 PTM-types amounting to 555,110 sites. 
+
+```{r, include=FALSE}
+load("Data/RData/Human/master_struc2_alphafold_dssp.RData")
+load("Data/RData/Human/human_proteome.RData")
+load("Data/dbPTM/human_PTM_data.RData")
+O.GlcNAc.Database <- read.csv("~/Documents/PhD/Projects/PTM_project_final/Data/Human/OGlcNAcAtlas/O-GlcNAc Database.csv")
+O.GlcNAc.Database <- unique(O.GlcNAc.Database)
+O.GlcNAc_sites <- subset(master_struc3, paste0(Protein,Position) %in% paste0(O.GlcNAc.Database$Accession,O.GlcNAc.Database$Position.in.Protein) & Residue %in% c("S","T") , select = c(1,3,2))
+O.GlcNAc_sites$Type <- "O-GlcNAcylation"
+O.GlcNAc_sites$Type2 <- paste0(O.GlcNAc_sites$Type,"_",O.GlcNAc_sites$Residue)
+colnames(PTMs_df_human)[3] <- "Residue"
+PTMs_df_human <- rbind(PTMs_df_human,O.GlcNAc_sites)
+#Preparation and some statistics
+PTMs_df_human <- subset(PTMs_df_human, !Type2 %in% c("Neddylation_K","S-palmitoylation_C","S-nitrosylation_C"))
+master_struc_ptms <- merge(master_struc3,PTMs_df_human, by=c("Protein","Position","Residue")) #571759
+length(unique(master_struc3$Protein)) #19233
+length(unique(master_struc3$APRcount_tango)) #84573
+master_df3_filtered <- subset(master_struc3, Topology %in% c("inside","outside"))
+master_res_ptms_filtered <- subset(master_struc_ptms, Topology %in% c("inside","outside"))
+rm(master_struc3)
+rm(master_struc_ptms)
+gc()
+#Total number of different PTMs
+table(master_res_ptms_filtered$Type2)
+#Number residues per category
+table(master_df3_filtered$APRdef_tango)
+#Number PTMs in APRs 
+aprs <- subset(master_res_ptms_filtered, APRdef_tango == "APR")
+length(unique(aprs$APRcount_tango)) 
+length(unique(aprs$Protein)) 
+aprs$id <- paste0(aprs$APRcount_tango,"_",aprs$Position)
+length(unique(aprs$id)) 
+table(aprs$Type2) #number of sites per PTM-type
+#Number PTMs in first flanking regions
+gk <- subset(master_res_ptms_filtered, APRdef_tango == "GK_1")
+length(unique(gk$Protein)) 
+gk$id <- paste0(gk$Protein,"_",gk$Position)
+length(unique(gk$id)) 
+table(gk$Type2) #number of sites per PTM-type
+master_df3_filtered$APRdef2_tango[which(master_df3_filtered$APRdef_tango == "FR")] <- "0"
+master_res_ptms_filtered$APRdef2_tango[which(master_res_ptms_filtered$APRdef_tango == "FR")] <- "0"
+```
+
+First, we analyzed the relative enrichment of all PTM sites in or close to APRs. PTM sites are significantly enriched far away from APRs (Figure 1b). This is not surprising as APRs are normally partially or completely buried, while most PTM sites are solvent accessible (Supplementary Figure 1a). In order to determine if there a selection pressure for different PTM-types to be in on near APRs we need to restrict the analysis to positions that are solvent accessible, and hence can potentially be modified. We obtained solvent accessibility values for all proteins in the dataset based on their AlphaFold structures. 
+
+```{r, include=FALSE}
+#Number PTMs per category. Solvent accessibility and disorder
+table(master_res_ptms_filtered$APRdef_tango)
+table(master_res_ptms_filtered$APRdef_tango) / table(master_df3_filtered$APRdef_tango) / (nrow(master_res_ptms_filtered) / nrow(master_df3_filtered)) #Relative frequencies general
+ptm_types <- as.character(unique(master_res_ptms_filtered$Type2))
+for (i in 1:length(ptm_types)){
+  residue_temp <- strsplit(ptm_types[i], "_")[[1]][2]
+  temp_df_apr <- subset(master_df3_filtered, Residue == residue_temp)
+  temp_df_ptms <- subset(PTMs_df_human, Type2 == ptm_types[i])
+  temp_df_ptms_apr <- merge(temp_df_apr,temp_df_ptms, by=c("Protein","Position","Residue"), all.x = T) 
+  temp_df_ptms_apr$Type2[which(is.na(temp_df_ptms_apr$Type2))] <- residue_temp
+  ptm_type_temp <- subset(temp_df_ptms_apr, Type2 == ptm_types[i])
+  #line <- quantile(ptm_type_temp$Rel_acc, probs = c(0.05, 0.95))[1]
+  line <- 0.25
+  pdf(file=paste0("Plots/Solvent_accessibility/",ptm_types[i],".pdf"), width = 8.46, height = 5.98)
+  p <- ggplot(temp_df_ptms_apr, aes(x=Rel_acc, color=Type2)) +
+  geom_density()+
+  geom_vline(xintercept = line, linetype="dotted", 
+                color = "black") +
+  labs(x="Solvent accessibility", y = "Density") + theme(axis.text=element_text(size=11,colour = "black"), axis.title=element_text(size=11,colour = "black")) +
+  scale_color_manual(values=c("#999999", "#E69F00", "#56B4E9")) + theme(legend.position="none") +
+  theme_classic()
+  print(p)
+  dev.off()
+  pdf(file=paste0("Plots/Disordered/",ptm_types[i],".pdf"), width = 8.46, height = 5.98)
+  p <- ggplot(temp_df_ptms_apr, aes(x=ALPHA_SCORE, color=Type2)) +
+  geom_density()+
+  geom_vline(xintercept = line, linetype="dotted", 
+                color = "black") +
+  labs(x="AlphaFold Score (Measure of disorder)", y = "Density") + 
+  scale_color_manual(values=c("#999999", "#E69F00", "#56B4E9"))+
+  theme_classic()
+  print(p)
+  dev.off()
+}
+#Enrichment per PTM type and statistical significance 
+ptm_types <- as.character(unique(master_res_ptms_filtered$Type2))
+for (i in 1:length(ptm_types)){
+  type <- ptm_types[i]
+  res <- strsplit(ptm_types[i], "_")[[1]][2]
+  glyc <- subset(master_res_ptms_filtered, Type2 == type)
+  prots <- unique(glyc$Protein)
+  glyc$order <- "Ordered"
+  glyc$order[which(glyc$ALPHA_SCORE < 50)] <- "Disordered"
+  print(type)
+  print(table(glyc$order) / nrow(glyc))
+}
+#APRs residues that are accessible
+APRs_residues <- subset(master_df3_filtered, APRdef_tango == "APR")
+APRs_residues$accessibility <- "Partially buried"
+APRs_residues$accessibility[which(APRs_residues$Rel_acc < 0.25)] <- "Buried"
+APRs_residues$accessibility[which(APRs_residues$Rel_acc > 0.8)] <- "Exposed"
+table(APRs_residues$accessibility) / nrow(APRs_residues)
+#APRs residues that are disordered
+APRs_residues <- subset(master_df3_filtered, APRdef2_tango == "1")
+APRs_residues$order <- "Ordered"
+APRs_residues$order[which(APRs_residues$ALPHA_SCORE < 50)] <- "Disordered"
+table(APRs_residues$order) / nrow(APRs_residues)
+#GR1s residues that are disordered
+GRs_residues <- subset(master_df3_filtered, APRdef2_tango %in% c("2"))
+GRs_residues$order <- "Ordered"
+GRs_residues$order[which(GRs_residues$ALPHA_SCORE < 50)] <- "Disordered"
+table(GRs_residues$order) / nrow(GRs_residues)
+#GR2s residues that are disordered
+GRs_residues <- subset(master_df3_filtered, APRdef2_tango %in% c("3"))
+GRs_residues$order <- "Ordered"
+GRs_residues$order[which(GRs_residues$ALPHA_SCORE < 50)] <- "Disordered"
+table(GRs_residues$order) / nrow(GRs_residues)
+#GR3s residues that are disordered
+GRs_residues <- subset(master_df3_filtered, APRdef2_tango %in% c("4"))
+GRs_residues$order <- "Ordered"
+GRs_residues$order[which(GRs_residues$ALPHA_SCORE < 50)] <- "Disordered"
+table(GRs_residues$order) / nrow(GRs_residues)
+#non-APRs residues that are disordered
+DR_residues <- subset(master_df3_filtered, APRdef2_tango == "0")
+DR_residues$order <- "Ordered"
+DR_residues$order[which(DR_residues$ALPHA_SCORE < 50)] <- "Disordered"
+table(DR_residues$order) / nrow(DR_residues)
+```
+
+Enrichment at the local level (primary sequence)
+
+```{r, include=FALSE}
+#Enrichment per PTM type and statistical significance including side
+ptm_types <- as.character(unique(master_res_ptms_filtered$Type2))
+mat_ptm_enrichment = matrix(numeric(length(ptm_types)*10), nrow = length(ptm_types), ncol = 8)
+colnames(mat_ptm_enrichment) <- c("Distal region","GR3 N-ter","GR2 N-ter","GR1 N-ter","APR","GR1 C-ter","GR2 C-ter","GR3 C-ter")
+rownames(mat_ptm_enrichment) <- ptm_types
+for (i in 1:length(ptm_types)){
+  type <- ptm_types[i]
+  res <- strsplit(ptm_types[i], "_")[[1]][2]
+  ptm_df <- subset(master_res_ptms_filtered, Type2 == type)
+  prots <- unique(ptm_df$Protein)
+  res_df <- subset(master_df3_filtered, Protein %in% prots)
+  dis <- nrow(subset(master_res_ptms_filtered, APRdef2_tango== "0" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "0" & Residue == res)) * 100
+  apr <- nrow(subset(master_res_ptms_filtered, APRdef2_tango == "1" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "1" & Residue == res)) * 100
+  gk_l <- nrow(subset(master_res_ptms_filtered, APRdef2_tango == "2" & Side == "N_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "2" & Side == "N_ter" & Residue == res)) * 100
+  gk_r <- nrow(subset(master_res_ptms_filtered, APRdef2_tango == "2" & Side == "C_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "2"  & Side == "C_ter" & Residue == res)) * 100
+  fl1_l <- nrow(subset(master_res_ptms_filtered, APRdef2_tango == "3"  & Side == "N_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "3"  & Side == "N_ter" & Residue == res)) * 100
+  fl1_r <- nrow(subset(master_res_ptms_filtered, APRdef2_tango == "3" & Side == "C_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "3"  & Side == "C_ter" & Residue == res)) * 100
+  fl2_l <- nrow(subset(master_res_ptms_filtered, APRdef2_tango  == "4"  & Side == "N_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango  == "4"  & Side == "N_ter" & Residue == res)) * 100
+  fl2_r <- nrow(subset(master_res_ptms_filtered, APRdef2_tango  == "4" & Side == "C_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango  == "4"  & Side == "C_ter" & Residue == res)) * 100
+  all <- nrow(subset(master_res_ptms_filtered, Type2 == type)) / nrow(subset(res_df, Residue == res)) * 100
+  dat2 <- c(dis,fl2_l,fl1_l,gk_l,apr,gk_r,fl1_r,fl2_r,all)
+  mat_ptm_enrichment[i,] <- dat2[1:8] / dat2[9]
+  print(type)
+  print(nrow(ptm_df))
+  print(dat2[1:8] / dat2[9])
+}
+Heatmap(mat_ptm_enrichment, 
+        name = "Relative frequency", cluster_columns = FALSE, col = circlize::colorRamp2(c(1.5,1,0.25), c("red", "white", "blue")),
+        column_names_gp = gpar(fontsize = 12) , row_names_gp = gpar(fontsize = 12),clustering_distance_rows = "pearson",border_gp = gpar(col = "black", lty = 1))
+#Enrichment per PTM type and statistical significance including accessibility
+mat_ptm_enrichment_acc = matrix(numeric(length(ptm_types)*10), nrow = length(ptm_types), ncol = 8)
+colnames(mat_ptm_enrichment_acc) <- c("Distal region","GR3 N-ter","GR2 N-ter","GR1 N-ter","APR","GR1 C-ter","GR2 C-ter","GR3 C-ter")
+rownames(mat_ptm_enrichment_acc) <- ptm_types
+for (i in 1:length(ptm_types)){
+  type <- ptm_types[i]
+  res <- strsplit(ptm_types[i], "_")[[1]][2]
+  glyc <- subset(master_res_ptms_filtered, Type2 == type)
+  prots <- unique(glyc$Protein)
+  res_df <- subset(master_df3_filtered, Protein %in% prots & Rel_acc > 0.25)
+  ptm_df <- subset(glyc, Rel_acc > 0.25)
+  dis <- nrow(subset(ptm_df, APRdef2_tango== "0" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "0" & Residue == res)) * 100
+  apr <- nrow(subset(ptm_df, APRdef2_tango == "1"& Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "1" & Residue == res)) * 100
+  gk_l <- nrow(subset(ptm_df, APRdef2_tango == "2" & Side == "N_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "2" & Side == "N_ter" & Residue == res)) * 100
+  gk_r <- nrow(subset(ptm_df, APRdef2_tango == "2" & Side == "C_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "2"  & Side == "C_ter" & Residue == res)) * 100
+  fl1_l <- nrow(subset(ptm_df, APRdef2_tango == "3"  & Side == "N_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "3"  & Side == "N_ter" & Residue == res)) * 100
+  fl1_r <- nrow(subset(ptm_df, APRdef2_tango == "3" & Side == "C_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "3"  & Side == "C_ter" & Residue == res)) * 100
+  fl2_l <- nrow(subset(ptm_df, APRdef2_tango  == "4"  & Side == "N_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango  == "4"  & Side == "N_ter" & Residue == res)) * 100
+  fl2_r <- nrow(subset(ptm_df, APRdef2_tango  == "4" & Side == "C_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango  == "4"  & Side == "C_ter" & Residue == res)) * 100
+  all <- nrow(subset(ptm_df, Type2 == type)) / nrow(subset(res_df, Residue == res)) * 100
+  dat2 <- c(dis,fl2_l,fl1_l,gk_l,apr,gk_r,fl1_r,fl2_r,all)
+  mat_ptm_enrichment_acc[i,] <- dat2[1:8] / dat2[9]
+  print(type)
+  print(nrow(ptm_df))
+  print(dat2[1:8] / dat2[9])
+}
+Heatmap(mat_ptm_enrichment_acc, 
+        name = "Relative frequency", cluster_columns = FALSE, col = circlize::colorRamp2(c(1.5,1,0.25), c("red", "white", "blue")),
+        column_names_gp = gpar(fontsize = 9) , row_names_gp = gpar(fontsize = 7), clustering_distance_rows = "pearson")
+#Enrichment per PTM type and statistical significance including order regions only
+mat_ptm_enrichment_ord_only = matrix(numeric(length(ptm_types)*10), nrow = length(ptm_types), ncol = 8)
+colnames(mat_ptm_enrichment_ord_only) <- c("Distal region","GR3 N-ter","GR2 N-ter","GR1 N-ter","APR","GR1 C-ter","GR2 C-ter","GR3 C-ter")
+rownames(mat_ptm_enrichment_ord_only) <- ptm_types
+for (i in 1:length(ptm_types)){
+  type <- ptm_types[i]
+  res <- strsplit(ptm_types[i], "_")[[1]][2]
+  glyc <- subset(master_res_ptms_filtered, Type2 == type)
+  prots <- unique(glyc$Protein)
+  res_df <- subset(master_df3_filtered, Protein %in% prots & ALPHA_SCORE >= 50)
+  ptm_df <- subset(glyc, ALPHA_SCORE >= 50)
+  dis <- nrow(subset(ptm_df, APRdef2_tango== "0" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "0" & Residue == res)) * 100
+  apr <- nrow(subset(ptm_df, APRdef2_tango == "1"& Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "1" & Residue == res)) * 100
+  gk_l <- nrow(subset(ptm_df, APRdef2_tango == "2" & Side == "N_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "2" & Side == "N_ter" & Residue == res)) * 100
+  gk_r <- nrow(subset(ptm_df, APRdef2_tango == "2" & Side == "C_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "2"  & Side == "C_ter" & Residue == res)) * 100
+  fl1_l <- nrow(subset(ptm_df, APRdef2_tango == "3"  & Side == "N_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "3"  & Side == "N_ter" & Residue == res)) * 100
+  fl1_r <- nrow(subset(ptm_df, APRdef2_tango == "3" & Side == "C_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "3"  & Side == "C_ter" & Residue == res)) * 100
+  fl2_l <- nrow(subset(ptm_df, APRdef2_tango  == "4"  & Side == "N_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango  == "4"  & Side == "N_ter" & Residue == res)) * 100
+  fl2_r <- nrow(subset(ptm_df, APRdef2_tango  == "4" & Side == "C_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango  == "4"  & Side == "C_ter" & Residue == res)) * 100
+  all <- nrow(subset(ptm_df, Type2 == type)) / nrow(subset(res_df, Residue == res)) * 100
+  dat2 <- c(dis,fl2_l,fl1_l,gk_l,apr,gk_r,fl1_r,fl2_r,all)
+  mat_ptm_enrichment_ord_only[i,] <- dat2[1:8] / dat2[9]
+  print(type)
+  print(nrow(ptm_df))
+  print(dat2[1:8] / dat2[9])
+}
+Heatmap(mat_ptm_enrichment_ord_only, 
+        name = "Relative frequency", cluster_columns = FALSE, col = circlize::colorRamp2(c(1.5,1,0.25), c("red", "white", "blue")),
+        column_names_gp = gpar(fontsize = 9) , row_names_gp = gpar(fontsize = 7), clustering_distance_rows = "pearson")
+#Enrichment per PTM type and statistical significance including order and solvent accessible regions only
+mat_ptm_enrichment_ord = matrix(numeric(length(ptm_types)*10), nrow = length(ptm_types), ncol = 8)
+colnames(mat_ptm_enrichment_ord) <- c("Distal region","GR3 N-ter","GR2 N-ter","GR1 N-ter","APR","GR1 C-ter","GR2 C-ter","GR3 C-ter")
+rownames(mat_ptm_enrichment_ord) <- ptm_types
+for (i in 1:length(ptm_types)){
+  type <- ptm_types[i]
+  res <- strsplit(ptm_types[i], "_")[[1]][2]
+  glyc <- subset(master_res_ptms_filtered, Type2 == type)
+  prots <- unique(glyc$Protein)
+  res_df <- subset(master_df3_filtered, Protein %in% prots & Rel_acc > 0.25 & ALPHA_SCORE >= 50)
+  ptm_df <- subset(glyc, Rel_acc > 0.25 & ALPHA_SCORE >= 50)
+  dis <- nrow(subset(ptm_df, APRdef2_tango== "0" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "0" & Residue == res)) * 100
+  apr <- nrow(subset(ptm_df, APRdef2_tango == "1"& Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "1" & Residue == res)) * 100
+  gk_l <- nrow(subset(ptm_df, APRdef2_tango == "2" & Side == "N_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "2" & Side == "N_ter" & Residue == res)) * 100
+  gk_r <- nrow(subset(ptm_df, APRdef2_tango == "2" & Side == "C_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "2"  & Side == "C_ter" & Residue == res)) * 100
+  fl1_l <- nrow(subset(ptm_df, APRdef2_tango == "3"  & Side == "N_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "3"  & Side == "N_ter" & Residue == res)) * 100
+  fl1_r <- nrow(subset(ptm_df, APRdef2_tango == "3" & Side == "C_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango == "3"  & Side == "C_ter" & Residue == res)) * 100
+  fl2_l <- nrow(subset(ptm_df, APRdef2_tango  == "4"  & Side == "N_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango  == "4"  & Side == "N_ter" & Residue == res)) * 100
+  fl2_r <- nrow(subset(ptm_df, APRdef2_tango  == "4" & Side == "C_ter" & Type2 == type)) / nrow(subset(res_df, APRdef2_tango  == "4"  & Side == "C_ter" & Residue == res)) * 100
+  all <- nrow(subset(ptm_df, Type2 == type)) / nrow(subset(res_df, Residue == res)) * 100
+  dat2 <- c(dis,fl2_l,fl1_l,gk_l,apr,gk_r,fl1_r,fl2_r,all)
+  mat_ptm_enrichment_ord[i,] <- dat2[1:8] / dat2[9]
+  print(type)
+  print(nrow(ptm_df))
+  print(dat2[1:8] / dat2[9])
+}
+Heatmap(mat_ptm_enrichment_ord, 
+        name = "Relative frequency", cluster_columns = FALSE, col = circlize::colorRamp2(c(1.5,1,0.25), c("red", "white", "blue")),
+        column_names_gp = gpar(fontsize = 9) , row_names_gp = gpar(fontsize = 7), clustering_distance_rows = "pearson")
+#Statistics for accessibility (uncomment for statistics of accessibility)
+type <- "Sulfoxidation_M"
+res <- strsplit(type, "_")[[1]][2]
+glyc <- subset(master_res_ptms_filtered, Type2 == type)
+prots <- glyc$Protein
+res_df <- subset(master_df3_filtered,Protein %in% prots & Residue == res & ALPHA_SCORE >= 50)
+ptm_df <- subset(master_res_ptms_filtered, Type2 == type & ALPHA_SCORE >= 50)
+#res_df <- subset(master_df3_filtered,Protein %in% prots & Residue == res &  Rel_acc > 0.25 & ALPHA_SCORE >= 50)
+#ptm_df <- subset(master_res_ptms_filtered, Type2 == type &  Rel_acc > 0.25 & ALPHA_SCORE >= 50)
+#res_df <- subset(master_df3_filtered,Protein %in% prots & Residue == res &  Rel_acc > 0.25)
+#ptm_df <- subset(master_res_ptms_filtered, Type2 == type &  Rel_acc > 0.25)
+#res_df <- subset(master_df3_filtered,Protein %in% prots & Residue == res)
+#ptm_df <- subset(master_res_ptms_filtered, Type2 ==type)
+res_ptm_df <- merge(res_df,ptm_df,all.x = TRUE)
+res_ptm_df$Side[which(res_ptm_df$APRdef_tango == "FR")] <- "None"
+res_ptm_df$APRdef_tango[which(res_ptm_df$APRdef_tango == "FR")] <- "Distal region"
+res_ptm_df$PTM <- "No"
+res_ptm_df$PTM[which(res_ptm_df$Type2 == type)] <- "Yes"
+res_ptm_df$APRdef_tango <- paste0(res_ptm_df$APRdef_tango,"_",res_ptm_df$Side)
+res_ptm_df <- as.matrix(table(res_ptm_df$APRdef_tango,res_ptm_df$PTM))
+tot_prot <- c(sum(res_ptm_df[,1]),sum(res_ptm_df[,2]))
+res_ptm_df <- rbind(res_ptm_df, tot_prot)
+#Chi-square test of association  #Website: biostathandbook.com/chiind.html
+PT = pairwiseNominalIndependence(res_ptm_df,
+                                 compare = "row",
+                                 fisher  = TRUE,
+                                 gtest   = FALSE,
+                                 chisq   = FALSE,
+                                 method  = "fdr", 
+                                 digits  = 3)
+PT <- subset(PT, grepl("tot_prot", PT$Comparison, fixed = TRUE))
+PT <- PT[order(PT$p.Fisher),]
+rownames(PT) <- NULL 
+PT$p.adj.Fisher <- PT$p.Fisher * (nrow(PT) / as.numeric(rownames(PT)))
+PT$final <- NA
+PT$final[which(PT$p.adj.Fisher < 0.05)] <- "*"
+PT$final[which(PT$p.adj.Fisher < 0.01)] <- "**"
+PT$final[which(PT$p.adj.Fisher < 0.001)] <- "***"
+PT
+```
+
+
+```{r, include=FALSE}
+#PTM ASN predictor based on sequon
+all_res <- paste(master_df3_filtered$Residue, collapse = '')
+all_res <- gsub('N[^P][ST]', '210', all_res)
+all_res <- unlist(strsplit(all_res,""))
+master_df3_filtered$glyc <- all_res 
+master_df3_filtered$loc <- "No"
+master_df3_filtered$loc[which((master_df3_filtered$Nucleus == "No" & master_df3_filtered$Cytoplasm == "No" & master_df3_filtered$Mitochondrion == "No") &
+                          (master_df3_filtered$Secreted == "Yes" | master_df3_filtered$Membrane == "Yes" | master_df3_filtered$Endoplasmic_reticulum == "Yes" | master_df3_filtered$Golgi == "Yes" | master_df3_filtered$Lysosome == "Yes"))] <- "Extra"
+master_df3_filtered$loc[which((master_df3_filtered$Nucleus == "Yes" | master_df3_filtered$Cytoplasm == "Yes" | master_df3_filtered$Mitochondrion == "Yes") &
+                          (master_df3_filtered$Secreted == "No" & master_df3_filtered$Membrane == "No" & master_df3_filtered$Endoplasmic_reticulum == "No" & master_df3_filtered$Golgi == "No" & master_df3_filtered$Lysosome == "No"))] <- "Intra"
+nlinked <- subset(PTMs_df_human, Type2 == "N-linked Glycosylation_N", select = c(1,2,3,5))
+master_df3_filtered$loc[which(master_df3_filtered$Protein %in% nlinked$Protein)] <- "Extra"
+master_df3_filtered <- merge(master_df3_filtered, nlinked, by=c("Protein","Position","Residue"), all.x = TRUE)
+master_df3_filtered$glyc[which(master_df3_filtered$glyc == 0)] <- as.character(master_df3_filtered$Residue[which(master_df3_filtered$glyc == 0)])
+master_df3_filtered$glyc[which(master_df3_filtered$glyc == 1)] <- as.character(master_df3_filtered$Residue[which(master_df3_filtered$glyc == 1)])
+master_df3_filtered$glyc[which(master_df3_filtered$glyc == 2)] <- "Sequon"
+master_df3_filtered$glyc[which(master_df3_filtered$Type2 == "N-linked Glycosylation_N")] <- "N-linked Glycosylation_N"
+```
+
+Check functionally importance (difference between sequon)
+
+```{r, include=FALSE}
+##Enrichment per PTM type and statistical significance including side
+types <- c("Sequon.Intra","Sequon.Extra","N-linked Glycosylation_N.Extra")
+bio_enrichment = matrix(numeric(length(types)*9), nrow = length(types), ncol = 8)
+colnames(bio_enrichment) <- c("Distal region","FR3 N-ter","FR2 N-ter","FR1 N-ter","APR","FR1 C-ter","FR2 C-ter","FR3 C-ter")
+rownames(bio_enrichment) <- types
+for (i in 1:length(types)){
+  print(i)
+  temp_loc <- strsplit(types[i], "\\.")[[1]][2]
+  temp_res <- strsplit(types[i], "\\.")[[1]][1]
+  asp <- subset(master_df3_filtered, Residue == "N" & loc == temp_loc)
+  glyc <- subset(master_df3_filtered, glyc == temp_res & loc == temp_loc)
+  dis <- nrow(subset(glyc, APRdef2_tango == 0)) / nrow(subset(asp, APRdef2_tango == 0)) * 100
+  apr <- nrow(subset(glyc, APRdef2_tango == 1 )) / nrow(subset(asp, APRdef2_tango == 1)) * 100
+  gk_l <- nrow(subset(glyc, APRdef2_tango == 2 & Side == "N_ter")) / nrow(subset(asp, APRdef2_tango == 2 & Side == "N_ter")) * 100
+  gk_r <- nrow(subset(glyc, APRdef2_tango == 2 & Side == "C_ter")) / nrow(subset(asp, APRdef2_tango == 2  & Side == "C_ter")) * 100
+  fl1_l <- nrow(subset(glyc, APRdef2_tango == 3  & Side == "N_ter" )) / nrow(subset(asp, APRdef2_tango == 3  & Side == "N_ter")) * 100
+  fl1_r <- nrow(subset(glyc, APRdef2_tango == 3 & Side == "C_ter" )) / nrow(subset(asp, APRdef2_tango == 3  & Side == "C_ter")) * 100
+  fl2_l <- nrow(subset(glyc, APRdef2_tango  == 4  & Side == "N_ter" )) / nrow(subset(asp, APRdef2_tango  == 4  & Side == "N_ter")) * 100
+  fl2_r <- nrow(subset(glyc, APRdef2_tango  == 4 & Side == "C_ter" )) / nrow(subset(asp, APRdef2_tango  == 4  & Side == "C_ter")) * 100
+  all <- nrow(subset(glyc)) / nrow(subset(asp)) * 100
+  dat2 <- c(dis,fl2_l,fl1_l,gk_l,apr,gk_r,fl1_r,fl2_r,all)
+  bio_enrichment[i,] <- dat2[1:8] / dat2[9]
+  print(nrow(glyc))
+  print(dat2[1:8] / dat2[9])
+}
+save(bio_enrichment, file = "Data/RData/Human/bio_enrichment.RData")
+#Generate random sequence with secreted distributions  
+protein = c("A","C","D","E","F","G","H","I","K","L","M","N","P","Q","R","S","T","V","W","Y")
+extracellular <- subset(master_df3_filtered, loc == "Extra")
+secreted_num_prot <- length(unique(extracellular$Protein))
+extracellular$length <- 1
+proteinsum <- aggregate(length ~ Protein, data=extracellular, FUN="sum")
+mean_length <- mean(proteinsum$length)
+table(extracellular$Residue) / length(extracellular$Residue)
+protein_probabilities = table(extracellular$Residue) / length(extracellular$Residue)
+prot_sequences <- NULL
+headers <- NULL
+for (i in 1:5000) {
+  line_header = paste0("Protein_", i)
+  Protein_sequence = paste(sample(protein,
+                                  mean_length,
+                                  replace=TRUE,
+                                  prob=protein_probabilities),
+                           collapse="")
+  prot_sequences <- c(prot_sequences, Protein_sequence)
+  headers <- c(headers, line_header)
+}
+write.fasta(as.list(prot_sequences), 
+            headers, 
+            file.out="Data/Human/Random/random_extra.fasta", 
+            open = "w", 
+            nbchar = 60, 
+            as.string = TRUE)
+protein = c("A","C","D","E","F","G","H","I","K","L","M","N","P","Q","R","S","T","V","W","Y")
+intracellular <- subset(master_df3_filtered, loc == "Intra")
+nucleous_num_prot <- length(unique(intracellular$Protein))
+intracellular$length <- 1
+proteinsum <- aggregate(length ~ Protein, data=intracellular, FUN="sum")
+mean_length <- mean(proteinsum$length)
+table(intracellular$Residue) / length(intracellular$Residue)
+protein_probabilities = table(intracellular$Residue) / length(intracellular$Residue)
+prot_sequences <- NULL
+headers <- NULL
+for (i in 1:5000) {
+  line_header = paste0("Protein_", i)
+  Protein_sequence = paste(sample(protein,
+                                  mean_length,
+                                  replace=TRUE,
+                                  prob=protein_probabilities),
+                           collapse="")
+  prot_sequences <- c(prot_sequences, Protein_sequence)
+  headers <- c(headers, line_header)
+}
+write.fasta(as.list(prot_sequences), 
+            headers, 
+            file.out="Data/Human/Random/random_intra.fasta", 
+            open = "w", 
+            nbchar = 60, 
+            as.string = TRUE)
+#Compare predictions of random and real
+load("Data/RData/Random/master_df.RData")
+random_df <- master_df3
+all_res <- paste(random_df$Residue, collapse = '') 
+all_res <- gsub('N[^P][ST]', '100', all_res)
+all_res <- unlist(strsplit(all_res,""))
+random_df$glyc <- all_res
+random_df$glyc[which(random_df$glyc == 0)] <- as.character(random_df$Residue[which(random_df$glyc == 0)])
+random_df$glyc[which(random_df$glyc == 1)] <- "Sequon"
+random_df_filtered <- subset(random_df, Topology %in% c("inside","outside"))
+random_df_filtered$APRdef2_tango[which(random_df_filtered$APRdef_tango == "FR")] <- "0"
+#Enrichment per PTM type and statistical significance including side
+types <- c("Sequon.Intra","Sequon.Extra")
+random_enrichment = matrix(numeric(length(types)*9), nrow = length(types), ncol = 8)
+colnames(random_enrichment) <- c("Distal region","FR3 N-ter","FR2 N-ter","FR1 N-ter","APR","FR1 C-ter","FR2 C-ter","FR3 C-ter")
+rownames(random_enrichment) <- c("Sequon.Intra.Random","Sequon.Extra.Random")
+for (i in 1:length(types)){
+  print(i)
+  temp_loc <- strsplit(types[i], "\\.")[[1]][2]
+  temp_res <- strsplit(types[i], "\\.")[[1]][1]
+  asp <- subset(random_df_filtered, Residue == "N" & type == temp_loc)
+  glyc <- subset(random_df_filtered, glyc == temp_res & type == temp_loc)
+  dis <- nrow(subset(glyc, APRdef2_tango== 0)) / nrow(subset(asp, APRdef2_tango == 0)) * 100
+  apr <- nrow(subset(glyc, APRdef2_tango == 1 )) / nrow(subset(asp, APRdef2_tango == 1)) * 100
+  gk_l <- nrow(subset(glyc, APRdef2_tango == 2 & Side == "N_ter")) / nrow(subset(asp, APRdef2_tango == 2 & Side == "N_ter")) * 100
+  gk_r <- nrow(subset(glyc, APRdef2_tango == 2 & Side == "C_ter")) / nrow(subset(asp, APRdef2_tango == 2  & Side == "C_ter")) * 100
+  fl1_l <- nrow(subset(glyc, APRdef2_tango == 3  & Side == "N_ter" )) / nrow(subset(asp, APRdef2_tango == 3  & Side == "N_ter")) * 100
+  fl1_r <- nrow(subset(glyc, APRdef2_tango == 3 & Side == "C_ter" )) / nrow(subset(asp, APRdef2_tango == 3  & Side == "C_ter")) * 100
+  fl2_l <- nrow(subset(glyc, APRdef2_tango  == 4  & Side == "N_ter" )) / nrow(subset(asp, APRdef2_tango  == 4  & Side == "N_ter")) * 100
+  fl2_r <- nrow(subset(glyc, APRdef2_tango  == 4 & Side == "C_ter" )) / nrow(subset(asp, APRdef2_tango  == 4  & Side == "C_ter")) * 100
+  all <- nrow(subset(glyc)) / nrow(subset(asp)) * 100
+  dat2 <- c(dis,fl2_l,fl1_l,gk_l,apr,gk_r,fl1_r,fl2_r,all)
+  random_enrichment[i,] <- dat2[1:8] / dat2[9]
+  print(nrow(glyc))
+  print(dat2[1:8] / dat2[9])
+}
+save(random_enrichment, file = "Data/RData/Human/random_enrichment.RData")
+matrix_enrichment <- rbind(random_enrichment,bio_enrichment)
+Heatmap(matrix_enrichment, 
+        name = "Relative frequency", cluster_columns = FALSE, col = circlize::colorRamp2(c(1.5,1,0.25), c("red", "white", "blue")),
+        column_names_gp = gpar(fontsize = 9) , row_names_gp = gpar(fontsize = 7), clustering_distance_rows = "pearson")
+#Ratio relative frequencies
+matrix_enrichment[5,] / ((matrix_enrichment[1,] + matrix_enrichment[2,] + matrix_enrichment[3,] + matrix_enrichment[4,])/4)
+#Statistics for accessibility 
+type <- "N-linked Glycosylation_N.Extra"
+temp_loc <- strsplit(type, "\\.")[[1]][2]
+temp_res <- strsplit(type, "\\.")[[1]][1]
+glyc <- subset(master_df3_filtered, loc == temp_loc & Residue == "N")
+#glyc <- subset(random_df_filtered, type == temp_loc & Residue == "N")
+glyc$Side[which(glyc$APRdef_tango == "FR")] <- "None"
+glyc$APRdef_tango[which(glyc$APRdef_tango == "FR")] <- "Distal region"
+glyc$PTM <- "No"
+glyc$PTM[which(glyc$glyc == temp_res)] <- "Yes"
+glyc$APRdef_tango <- paste0(glyc$APRdef_tango,"_",glyc$Side)
+glyc_df <- as.matrix(table(glyc$APRdef_tango,glyc$PTM))
+tot_prot <- c(sum(glyc_df[,1]),sum(glyc_df[,2]))
+glyc_df <- rbind(glyc_df, tot_prot)
+#Chi-square test of association  #Website: biostathandbook.com/chiind.html
+PT = pairwiseNominalIndependence(glyc_df,
+                                 compare = "row",
+                                 fisher  = TRUE,
+                                 gtest   = FALSE,
+                                 chisq   = FALSE,
+                                 method  = "fdr", 
+                                 digits  = 3)
+PT <- subset(PT, grepl("tot_prot", PT$Comparison, fixed = TRUE))
+PT <- PT[order(PT$p.Fisher),]
+rownames(PT) <- NULL 
+PT$p.adj.Fisher <- PT$p.Fisher * (nrow(PT) / as.numeric(rownames(PT)))
+PT$final <- NA
+PT$final[which(PT$p.adj.Fisher < 0.05)] <- "*"
+PT$final[which(PT$p.adj.Fisher < 0.01)] <- "**"
+PT$final[which(PT$p.adj.Fisher < 0.001)] <- "***"
+PT
+```
+
+Make control where distal regions are only regions between 4 and 10 residues away from the APR
+
+```{r, include=FALSE}
+##Enrichment per PTM type and statistical significance including side
+types <- c("Sequon.Intra","Sequon.Extra","N-linked Glycosylation_N.Extra")
+bio_enrichment = matrix(numeric(length(types)*9), nrow = length(types), ncol = 8)
+colnames(bio_enrichment) <- c("Distal region","GR3 N-ter","GR2 N-ter","GR1 N-ter","APR","GR1 C-ter","GR2 C-ter","GR3 C-ter")
+rownames(bio_enrichment) <- types
+for (i in 1:length(types)){
+  print(i)
+  temp_loc <- strsplit(types[i], "\\.")[[1]][2]
+  temp_res <- strsplit(types[i], "\\.")[[1]][1]
+  asp <- subset(master_df3_filtered, Residue == "N" & loc == temp_loc & APRdef_tango != "Distal region")
+  glyc <- subset(master_df3_filtered, glyc == temp_res & loc == temp_loc & APRdef_tango != "Distal region")
+  dis <- nrow(subset(glyc, APRdef2_tango == 0)) / nrow(subset(asp, APRdef2_tango == 0)) * 100
+  apr <- nrow(subset(glyc, APRdef2_tango == 1 )) / nrow(subset(asp, APRdef2_tango == 1)) * 100
+  gk_l <- nrow(subset(glyc, APRdef2_tango == 2 & Side == "N_ter")) / nrow(subset(asp, APRdef2_tango == 2 & Side == "N_ter")) * 100
+  gk_r <- nrow(subset(glyc, APRdef2_tango == 2 & Side == "C_ter")) / nrow(subset(asp, APRdef2_tango == 2  & Side == "C_ter")) * 100
+  fl1_l <- nrow(subset(glyc, APRdef2_tango == 3  & Side == "N_ter" )) / nrow(subset(asp, APRdef2_tango == 3  & Side == "N_ter")) * 100
+  fl1_r <- nrow(subset(glyc, APRdef2_tango == 3 & Side == "C_ter" )) / nrow(subset(asp, APRdef2_tango == 3  & Side == "C_ter")) * 100
+  fl2_l <- nrow(subset(glyc, APRdef2_tango  == 4  & Side == "N_ter" )) / nrow(subset(asp, APRdef2_tango  == 4  & Side == "N_ter")) * 100
+  fl2_r <- nrow(subset(glyc, APRdef2_tango  == 4 & Side == "C_ter" )) / nrow(subset(asp, APRdef2_tango  == 4  & Side == "C_ter")) * 100
+  all <- nrow(subset(glyc)) / nrow(subset(asp)) * 100
+  dat2 <- c(dis,fl2_l,fl1_l,gk_l,apr,gk_r,fl1_r,fl2_r,all)
+  bio_enrichment[i,] <- dat2[1:8] / dat2[9]
+  print(dat2[1:8] / dat2[9])
+  print(nrow(glyc))
+}
+#Compare predictions of random and real
+load("Data/RData/Random/master_df.RData")
+random_df <- master_df3
+all_res <- paste(random_df$Residue, collapse = '') 
+all_res <- gsub('N[^P][ST]', '100', all_res)
+all_res <- unlist(strsplit(all_res,""))
+random_df$glyc <- all_res
+random_df$glyc[which(random_df$glyc == 0)] <- as.character(random_df$Residue[which(random_df$glyc == 0)])
+random_df$glyc[which(random_df$glyc == 1)] <- "Sequon"
+random_df_filtered <- subset(random_df, Topology %in% c("inside","outside"))
+random_df_filtered$APRdef2_tango[which(random_df_filtered$APRdef_tango == "FR")] <- "0"
+#Enrichment per PTM type and statistical significance including side
+types <- c("Sequon.Intra","Sequon.Extra")
+random_enrichment = matrix(numeric(length(types)*9), nrow = length(types), ncol = 8)
+colnames(random_enrichment) <- c("Distal region","GR3 N-ter","GR2 N-ter","GR1 N-ter","APR","GR1 C-ter","GR2 C-ter","GR3 C-ter")
+rownames(random_enrichment) <- c("Sequon.Intra.Random","Sequon.Extra.Random")
+for (i in 1:length(types)){
+  print(i)
+  temp_loc <- strsplit(types[i], "\\.")[[1]][2]
+  temp_res <- strsplit(types[i], "\\.")[[1]][1]
+  asp <- subset(random_df_filtered, Residue == "N" & type == temp_loc & APRdef_tango != "Distal region")
+  glyc <- subset(random_df_filtered, glyc == temp_res & type == temp_loc & APRdef_tango != "Distal region")
+  dis <- nrow(subset(glyc, APRdef2_tango== 0)) / nrow(subset(asp, APRdef2_tango == 0)) * 100
+  apr <- nrow(subset(glyc, APRdef2_tango == 1 )) / nrow(subset(asp, APRdef2_tango == 1)) * 100
+  gk_l <- nrow(subset(glyc, APRdef2_tango == 2 & Side == "N_ter")) / nrow(subset(asp, APRdef2_tango == 2 & Side == "N_ter")) * 100
+  gk_r <- nrow(subset(glyc, APRdef2_tango == 2 & Side == "C_ter")) / nrow(subset(asp, APRdef2_tango == 2  & Side == "C_ter")) * 100
+  fl1_l <- nrow(subset(glyc, APRdef2_tango == 3  & Side == "N_ter" )) / nrow(subset(asp, APRdef2_tango == 3  & Side == "N_ter")) * 100
+  fl1_r <- nrow(subset(glyc, APRdef2_tango == 3 & Side == "C_ter" )) / nrow(subset(asp, APRdef2_tango == 3  & Side == "C_ter")) * 100
+  fl2_l <- nrow(subset(glyc, APRdef2_tango  == 4  & Side == "N_ter" )) / nrow(subset(asp, APRdef2_tango  == 4  & Side == "N_ter")) * 100
+  fl2_r <- nrow(subset(glyc, APRdef2_tango  == 4 & Side == "C_ter" )) / nrow(subset(asp, APRdef2_tango  == 4  & Side == "C_ter")) * 100
+  all <- nrow(subset(glyc)) / nrow(subset(asp)) * 100
+  dat2 <- c(dis,fl2_l,fl1_l,gk_l,apr,gk_r,fl1_r,fl2_r,all)
+  random_enrichment[i,] <- dat2[1:8] / dat2[9]
+  print(dat2[1:8] / dat2[9])
+  print(nrow(glyc))
+}
+matrix_enrichment <- rbind(random_enrichment,bio_enrichment)
+Heatmap(matrix_enrichment, 
+        name = "Relative frequency", cluster_columns = FALSE, col = circlize::colorRamp2(c(1.5,1,0.25), c("red", "white", "blue")),
+        column_names_gp = gpar(fontsize = 9) , row_names_gp = gpar(fontsize = 7), clustering_distance_rows = "pearson")
+#Ratio relative frequencies
+matrix_enrichment[5,] / ((matrix_enrichment[1,] + matrix_enrichment[2,] + matrix_enrichment[3,] + matrix_enrichment[4,])/4)
+#Statistics for accessibility 
+type <- "Sequon.Extra"
+temp_loc <- strsplit(type, "\\.")[[1]][2]
+temp_res <- strsplit(type, "\\.")[[1]][1]
+#glyc <- subset(master_df3_filtered, loc == temp_loc & Residue == "N" & APRdef_tango != "Distal region")
+glyc <- subset(random_df_filtered, type == temp_loc & Residue == "N" & APRdef_tango != "Distal region")
+glyc$Side[which(glyc$APRdef_tango == "FR")] <- "None"
+glyc$APRdef_tango[which(glyc$APRdef_tango == "FR")] <- "Distal region"
+glyc$PTM <- "No"
+glyc$PTM[which(glyc$glyc == temp_res)] <- "Yes"
+glyc$APRdef_tango <- paste0(glyc$APRdef_tango,"_",glyc$Side)
+glyc_df <- as.matrix(table(glyc$APRdef_tango,glyc$PTM))
+tot_prot <- c(sum(glyc_df[,1]),sum(glyc_df[,2]))
+glyc_df <- rbind(glyc_df, tot_prot)
+#Chi-square test of association  #Website: biostathandbook.com/chiind.html
+PT = pairwiseNominalIndependence(glyc_df,
+                                 compare = "row",
+                                 fisher  = TRUE,
+                                 gtest   = FALSE,
+                                 chisq   = FALSE,
+                                 method  = "fdr", 
+                                 digits  = 3)
+PT <- subset(PT, grepl("tot_prot", PT$Comparison, fixed = TRUE))
+PT <- PT[order(PT$p.Fisher),]
+rownames(PT) <- NULL 
+PT$p.adj.Fisher <- PT$p.Fisher * (nrow(PT) / as.numeric(rownames(PT)))
+PT$final <- NA
+PT$final[which(PT$p.adj.Fisher < 0.05)] <- "*"
+PT$final[which(PT$p.adj.Fisher < 0.01)] <- "**"
+PT$final[which(PT$p.adj.Fisher < 0.001)] <- "***"
+PT
+```
+
+Membrane proteins analysis (intracellular vs extracellular domains)
+
+```{r, include=FALSE}
+membrane_proteins <- subset(master_df3_filtered, Membrane == "Yes" & loc == "Extra")
+length(unique(membrane_proteins$Protein))
+types <- c("outside","inside")
+for (i in 1:length(types)){
+  asp <- subset(membrane_proteins, Residue == "N" & Topology == types[i])
+  glyc <- subset(membrane_proteins, glyc %in% c("Sequon","N-linked Glycosylation_N") & Topology == types[i])
+  dis <- nrow(subset(glyc, APRdef2_tango== 0)) / nrow(subset(asp, APRdef2_tango == 0)) * 100
+  apr <- nrow(subset(glyc, APRdef2_tango == 1 )) / nrow(subset(asp, APRdef2_tango == 1)) * 100
+  gk_l <- nrow(subset(glyc, APRdef2_tango == 2 & Side == "N_ter")) / nrow(subset(asp, APRdef2_tango == 2 & Side == "N_ter")) * 100
+  gk_r <- nrow(subset(glyc, APRdef2_tango == 2 & Side == "C_ter")) / nrow(subset(asp, APRdef2_tango == 2  & Side == "C_ter")) * 100
+  fl1_l <- nrow(subset(glyc, APRdef2_tango == 3  & Side == "N_ter" )) / nrow(subset(asp, APRdef2_tango == 3  & Side == "N_ter")) * 100
+  fl1_r <- nrow(subset(glyc, APRdef2_tango == 3 & Side == "C_ter" )) / nrow(subset(asp, APRdef2_tango == 3  & Side == "C_ter")) * 100
+  fl2_l <- nrow(subset(glyc, APRdef2_tango  == 4  & Side == "N_ter" )) / nrow(subset(asp, APRdef2_tango  == 4  & Side == "N_ter")) * 100
+  fl2_r <- nrow(subset(glyc, APRdef2_tango  == 4 & Side == "C_ter" )) / nrow(subset(asp, APRdef2_tango  == 4  & Side == "C_ter")) * 100
+  all <- nrow(subset(glyc)) / nrow(subset(asp)) * 100
+  dat2 <- c(dis,fl2_l,fl1_l,gk_l,apr,gk_r,fl1_r,fl2_r,all)
+  print(types[i])
+  print(nrow(glyc))
+  print(dat2[1:8] / dat2[10])
+}
+```
+
+Re-analysis using other aggregation predictors
+
+```{r, include=FALSE}
+proteins_sequon <- subset(master_df3_filtered, glyc %in% c("Sequon","N-linked Glycosylation_N") & loc != "No")
+table(proteins_sequon$glyc,proteins_sequon$loc)
+proteins_sequon <- subset(human_proteome,Protein %in% unique(proteins_sequon$Protein))
+save(proteins_sequon, file = "Data/Human/Other_predictors/sequences.RData")
+write.fasta(as.list(proteins_sequon$Sequence), 
+            proteins_sequon$Protein, 
+            file.out="Data/Human/Other_predictors/sequences.fasta", 
+            open = "w", 
+            nbchar = 60, 
+            as.string = TRUE)
+#Analyse CamSol data
+load("Data/RData/Human/master_struc2_alphafold_dssp.RData")
+locs <- unique(subset(master_struc3, select = c(1,16:22,35)))
+load("Data/RData/Human/master_df_camsol.RData")
+load("Data/dbPTM/human_PTM_data.RData")
+colnames(PTMs_df_human)[3] <- "Residue"
+master_df3_filtered <- subset(master_df3, Topology %in% c("inside","outside"))
+all_res <- paste(master_df3_filtered$Residue, collapse = '')
+all_res <- gsub('N[^P][ST]', '210', all_res)
+all_res <- unlist(strsplit(all_res,""))
+master_df3_filtered$glyc <- all_res 
+master_df3_filtered <- merge(master_df3_filtered, locs)
+master_df3_filtered$loc <- "No"
+master_df3_filtered$loc[which((master_df3_filtered$Nucleus == "No" & master_df3_filtered$Cytoplasm == "No" & master_df3_filtered$Mitochondrion == "No") &
+                          (master_df3_filtered$Secreted == "Yes" | master_df3_filtered$Membrane == "Yes" | master_df3_filtered$Endoplasmic_reticulum == "Yes" | master_df3_filtered$Golgi == "Yes" | master_df3_filtered$Lysosome == "Yes" ))] <- "Extra"
+master_df3_filtered$loc[which((master_df3_filtered$Nucleus == "Yes" | master_df3_filtered$Cytoplasm == "Yes" | master_df3_filtered$Mitochondrion == "Yes") &
+                          (master_df3_filtered$Secreted == "No" & master_df3_filtered$Membrane == "No" & master_df3_filtered$Endoplasmic_reticulum == "No" & master_df3_filtered$Golgi == "No" & master_df3_filtered$Lysosome == "No"))] <- "Intra"
+nlinked <- subset(PTMs_df_human, Type2 == "N-linked Glycosylation_N", select = c(1,2,3,5))
+master_df3_filtered$loc[which(master_df3_filtered$Protein %in% nlinked$Protein)] <- "Extra"
+master_df3_filtered <- merge(master_df3_filtered, nlinked, by=c("Protein","Position","Residue"), all.x = TRUE)
+master_df3_filtered$glyc[which(master_df3_filtered$glyc == 0)] <- as.character(master_df3_filtered$Residue[which(master_df3_filtered$glyc == 0)])
+master_df3_filtered$glyc[which(master_df3_filtered$glyc == 1)] <- as.character(master_df3_filtered$Residue[which(master_df3_filtered$glyc == 1)])
+master_df3_filtered$glyc[which(master_df3_filtered$glyc == 2)] <- "Sequon"
+master_df3_filtered$glyc[which(master_df3_filtered$Type2 == "N-linked Glycosylation_N")] <- "N-linked Glycosylation_N"
+types <- c("Sequon.Intra","Sequon.Extra","N-linked Glycosylation_N.Extra")
+bio_enrichment2 = matrix(numeric(length(types)*9), nrow = length(types), ncol = 9)
+colnames(bio_enrichment2) <- c("Distal region","FR3 N-ter","FR2 N-ter","FR1 N-ter","APR","FR1 C-ter","FR2 C-ter","FR3 C-ter","Distal region")
+rownames(bio_enrichment2) <- types
+for (i in 1:length(types)){
+  print(i)
+  temp_loc <- strsplit(types[i], "\\.")[[1]][2]
+  temp_res <- strsplit(types[i], "\\.")[[1]][1]
+  asp <- subset(master_df3_filtered, Residue == "N" & loc == temp_loc)
+  glyc <- subset(master_df3_filtered, glyc == temp_res & loc == temp_loc)
+  dis <- nrow(subset(glyc, APRdef2_camsol== 0)) / nrow(subset(asp, APRdef2_camsol == 0)) * 100
+  apr <- nrow(subset(glyc, APRdef2_camsol == 1 )) / nrow(subset(asp, APRdef2_camsol == 1)) * 100
+  gk_l <- nrow(subset(glyc, APRdef2_camsol == 2 & Side == "N_ter")) / nrow(subset(asp, APRdef2_camsol == 2 & Side == "N_ter")) * 100
+  gk_r <- nrow(subset(glyc, APRdef2_camsol == 2 & Side == "C_ter")) / nrow(subset(asp, APRdef2_camsol == 2  & Side == "C_ter")) * 100
+  fl1_l <- nrow(subset(glyc, APRdef2_camsol == 3  & Side == "N_ter" )) / nrow(subset(asp, APRdef2_camsol == 3  & Side == "N_ter")) * 100
+  fl1_r <- nrow(subset(glyc, APRdef2_camsol == 3 & Side == "C_ter" )) / nrow(subset(asp, APRdef2_camsol == 3  & Side == "C_ter")) * 100
+  fl2_l <- nrow(subset(glyc, APRdef2_camsol  == 4  & Side == "N_ter" )) / nrow(subset(asp, APRdef2_camsol  == 4  & Side == "N_ter")) * 100
+  fl2_r <- nrow(subset(glyc, APRdef2_camsol  == 4 & Side == "C_ter" )) / nrow(subset(asp, APRdef2_camsol  == 4  & Side == "C_ter")) * 100
+  all <- nrow(subset(glyc)) / nrow(subset(asp)) * 100
+  dat2 <- c(dis,fl2_l,fl1_l,gk_l,apr,gk_r,fl1_r,fl2_r,dis,all)
+  bio_enrichment2[i,] <- dat2[1:9] / dat2[10]
+  print(dat2[1:9] / dat2[10])
+  print(nrow(glyc))
+}
+Heatmap(bio_enrichment2, 
+        name = "Relative frequency", cluster_columns = FALSE, col = circlize::colorRamp2(c(1.5,1,0.25), c("red", "white", "blue")),
+        column_names_gp = gpar(fontsize = 9) , row_names_gp = gpar(fontsize = 7), clustering_distance_rows = "pearson")
+#Statistics for accessibility 
+type <- "Sequon.Extra"
+temp_loc <- strsplit(type, "\\.")[[1]][2]
+temp_res <- strsplit(type, "\\.")[[1]][1]
+glyc <- subset(master_df3_filtered, loc == temp_loc & Residue == "N")
+glyc$PTM <- "No"
+glyc$PTM[which(glyc$glyc == temp_res)] <- "Yes"
+glyc$APRdef_camsol <- paste0(glyc$APRdef_camsol,"_",glyc$Side)
+glyc_df <- as.matrix(table(glyc$APRdef_camsol,glyc$PTM))
+tot_prot <- c(sum(glyc_df[,1]),sum(glyc_df[,2]))
+glyc_df <- rbind(glyc_df, tot_prot)
+#Chi-square test of association  #Website: biostathandbook.com/chiind.html
+PT = pairwiseNominalIndependence(glyc_df,
+                                 compare = "row",
+                                 fisher  = TRUE,
+                                 gtest   = FALSE,
+                                 chisq   = FALSE,
+                                 method  = "fdr", 
+                                 digits  = 3)
+PT <- subset(PT, grepl("tot_prot", PT$Comparison, fixed = TRUE))
+PT <- PT[order(PT$p.Fisher),]
+rownames(PT) <- NULL 
+PT$p.adj.Fisher <- PT$p.Fisher * (nrow(PT) / as.numeric(rownames(PT)))
+PT$final <- NA
+PT$final[which(PT$p.adj.Fisher < 0.05)] <- "*"
+PT$final[which(PT$p.adj.Fisher < 0.01)] <- "**"
+PT$final[which(PT$p.adj.Fisher < 0.001)] <- "***"
+PT
+```
+
+Species analysis
+
+```{r, include=FALSE}
+load("Data/RData/Mouse/bio_mouse.RData")
+load("Data/RData/Yeast/bio_yeast.RData")
+load("Data/RData/Drosophila/bio_drosophila.RData")
+load("Data/RData/Arabidopsis/bio_arabidopsis.RData")
+load("Data/RData/C_elegans/bio_c_elegans.RData")
+load("Data/RData/Human/bio_enrichment.RData")
+bio_human <- rbind(bio_enrichment[1,],bio_enrichment[3,])
+rownames(bio_human) <- c("Human_no","Human_yes")
+rownames(bio_yeast) <- c("Yeast_no","Yeast_yes")
+rownames(bio_mouse) <- c("Mouse_no","Mouse_yes")
+rownames(bio_c_elegans) <- c("C_elegans_no","C_elegans_yes")
+rownames(bio_arabidopsis) <- c("Arabidopsis_no","Arabidopsis_yes")
+rownames(bio_drosophila) <- c("Drosophila_no","Drosophila_yes")
+bio_all <- rbind(bio_human,bio_yeast,bio_mouse,bio_c_elegans,bio_arabidopsis,bio_drosophila)
+row_ha <- rowAnnotation(loc = rep(c("Non-secretory pathway","Secretory pathway"),6))
+rownames(bio_all) = paste0("R", 1:12)
+colnames(bio_all) = paste0("C", 1:8)
+Heatmap(bio_all, 
+        name = "Relative frequency", cluster_columns = FALSE, col = circlize::colorRamp2(c(1.5,1,0.25), c("red", "white", "blue")), left_annotation = row_ha,
+        column_names_gp = gpar(fontsize = 9) , row_names_gp = gpar(fontsize = 7), clustering_distance_rows = "pearson")
+```
+
+Calculate general statistics and GO.
+
+```{r, include=FALSE}
+#Some stats
+master_df3_filtered$Side2 <- paste0(master_df3_filtered$APRdef2_tango,"_",master_df3_filtered$Side)
+all_proteins <- unique(subset(master_df3_filtered, select = 1))
+prots_extra <- unique(subset(master_df3_filtered, loc == "Extra", select = 1)) #5957
+prots_intra <- unique(subset(master_df3_filtered, loc == "Intra", select = 1)) #7688
+prots_glyc <- unique(subset(master_df3_filtered, loc == "Extra" & glyc == "N-linked Glycosylation_N", select = 1)) #4128
+prots_other <- unique(subset(master_df3_filtered, !loc %in% c("Extra","Intra"),select = 1)) #5588
+glyc_2 <- unique(subset(master_df3_filtered, glyc == "N-linked Glycosylation_N" & loc == "Extra" & Side2 %in% c("2_N_ter"), select = 1)) #389 prots (439 sites)
+glyc_3 <- unique(subset(master_df3_filtered, glyc == "N-linked Glycosylation_N" & loc == "Extra" & Side2 %in% c("3_N_ter"), select = 1)) #198 prots (210 sites)
+glyc_APR <- unique(subset(master_df3_filtered, glyc == "N-linked Glycosylation_N" & loc == "Extra" & Side2 %in% c("1_None"), select = 1)) #416 prots (506)
+glyc_R <- unique(subset(master_df3_filtered, glyc == "N-linked Glycosylation_N" & loc == "Extra" & Side2 %in% c("2_C_ter"), select = 1)) #270 prots (304)
+glyc <- unique(subset(master_df3_filtered, glyc == "N-linked Glycosylation_N" & Side2 %in% c("1_None","3_N_ter","2_N_ter"), select = 1)) #858 prots (1155)
+glyc_pos <- subset(master_df3_filtered, glyc == "N-linked Glycosylation_N" & !Side2 %in% c("0_None"))
+write.table(glyc, "Data/Human/Other/glyc.txt", append = FALSE, sep = " ", dec = ".",
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+#Look at subcellular location enrichment compared also to other proteins with glycosylation
+master_df3_filtered$loc2 <- "No"
+master_df3_filtered$loc2[which(master_df3_filtered$Protein %in% as.character(prots_extra$Protein))] <- "Extra"
+master_df3_filtered$loc2[which(master_df3_filtered$Protein %in% as.character(prots_glyc$Protein))] <- "Non-enriched position"
+master_df3_filtered$loc2[which(master_df3_filtered$Protein %in% as.character(glyc$Protein))] <- "Enriched position"
+prots_sub <- unique(subset(master_df3_filtered, select = c(1,40)))
+table(prots_sub$loc2)
+#Calculate number of ordered regions in N-glycans in APRs and GRs
+glyc_sites <- subset(master_df3_filtered, glyc == "N-linked Glycosylation_N" & APRdef2_tango != "0")
+table(glyc_sites$Side2)
+glyc_sites$order <- "Ordered"
+glyc_sites$order[which(glyc_sites$ALPHA_SCORE < 50)] <- "Disordered"
+print(table(glyc_sites$order) / nrow(glyc_sites))
+table(glyc_sites$order)
+```
+
+Chaperone substrates (UGGT)
+
+```{r, include=FALSE}
+UGT1_subs <- read.table("Data/Human/Other/UGT1_subs.txt", quote="\"", comment.char="")
+UGT1_subs <- unique(UGT1_subs$V1)
+UGT2_subs <- read.table("Data/Human/Other/UGT2_subs.txt", quote="\"", comment.char="")
+UGT2_subs <- unique(UGT2_subs$V1)
+ALG6_ko <- read.table("Data/Human/Other/ALG6_ko.txt", quote="\"", comment.char="")
+ALG6_ko <- unique(ALG6_ko$V1)
+UGT_subs <- unique(c(UGT1_subs,UGT2_subs,ALG6_ko))
+master_df3_filtered$Side2 <- paste0(master_df3_filtered$APRdef2_tango,"_",master_df3_filtered$Side)
+prots_extra <- unique(subset(master_df3_filtered, loc == "Extra", select = 1)) #5917
+prots_glyc <- unique(subset(master_df3_filtered, loc == "Extra" & glyc == "N-linked Glycosylation_N", select = 1)) #4128
+glyc_ep <- unique(subset(master_df3_filtered, glyc == "N-linked Glycosylation_N" & Side2 %in% c("1_None","3_N_ter","2_N_ter"), select = 1)) #858 
+glyc_no_ep <- subset(prots_glyc, !Protein %in%  glyc_ep$Protein) #3270
+UGT_subs <- UGT_subs[which(UGT_subs %in% prots_extra$Protein)]
+length(which(UGT_subs %in% glyc_no_ep$Protein)) / 3270 * 100
+length(which(UGT_subs %in% glyc_ep$Protein)) / 858 * 100
+```
+
+Protein expression. Decide which cells to use for MS experiment.
+
+```{r, include=FALSE}
+#Look at where these proteins are expressed
+proteinatlas <- read.delim("Data/Human/Other/proteinatlas.tsv")
+proteinatlas <- subset(proteinatlas, select = c(1:24,41:44))
+proteinatlas_extra <- subset(proteinatlas, Uniprot %in% prots_extra$Protein)
+table(proteinatlas_extra$RNA.cell.line.specificity)
+table(proteinatlas_extra$RNA.tissue.distribution)
+proteinatlas_glyc <- subset(proteinatlas, Uniprot %in% glyc$Protein)
+table(proteinatlas_glyc$RNA.cell.line.specificity)
+table(proteinatlas_glyc$RNA.tissue.distribution)
+#Decide what cell lines to use MS-proteomics 
+proteinatlas_glyc$RNA.tissue.specific.NX <- as.character(proteinatlas_glyc$RNA.tissue.specific.NX)
+s <- strsplit(proteinatlas_glyc$RNA.tissue.specific.NX, ";")
+cell_lines <- data.frame(Protein = rep(proteinatlas_glyc$Uniprot, sapply(s, length)), Cell_lines = unlist(s))
+cell_lines$Cell_lines <- as.character(cell_lines$Cell_lines)
+list_names <- strsplit(cell_lines$Cell_lines, ":")
+res <- matrix(nrow = length(cell_lines$Cell_lines), ncol = 1)
+for (i in 1:length(cell_lines$Cell_lines)){
+  res[i,] <- list_names[[i]][1]
+}
+cell_lines$Cell_lines <- res
+cell_lines_df <- data.frame(unclass(table(cell_lines$Cell_lines)))
+colnames(cell_lines_df) <- "counts"
+ggplot(data=cell_lines_df, aes(x = reorder(rownames(cell_lines_df), -counts),y = counts)) + 
+  geom_bar(stat = "identity") + theme_classic() + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+#Check gene expression levels per group (liver)
+proteinatlas <- read.delim("Data/Human/Other/proteinatlas.tsv")
+proteinatlas <- subset(proteinatlas, select = c(1:24,169)) #263 fibroblast, 266 hepatocytes, 166 HEK, 168 Hela
+proteinatlas$Class <- "Rest"
+proteinatlas$Class[which(proteinatlas$Uniprot %in% prots_extra$Protein)] <- "Secreted no seq enriched position"
+proteinatlas$Class[which(proteinatlas$Uniprot %in% glyc_R$Protein)] <- "2R"
+proteinatlas$Class[which(proteinatlas$Uniprot %in% glyc_APR$Protein)] <- "APR"
+proteinatlas$Class[which(proteinatlas$Uniprot %in% glyc_3$Protein)] <- "3L"
+proteinatlas$Class[which(proteinatlas$Uniprot %in% glyc_2$Protein)] <- "2L"
+proteinatlas2 <- subset(proteinatlas,Cell.RNA...Hep.G2..NX. > 25)
+table(proteinatlas2$Class) / table(proteinatlas$Class) * 100
+table(proteinatlas2$Class)
+aggregate(Cell.RNA...Hep.G2..NX. ~ Class, data=proteinatlas2, FUN="median")
+```
+  
+Calculate the efficiency of each glycan codon based on Huang et al.
+
+```{r, include=FALSE}
+#Glycan efficiency based on model from Huang et al.
+glyc <- subset(master_df3_filtered, glyc == "N-linked Glycosylation_N" & loc == "Extra")
+extra_proteins <- subset(master_df3_filtered, loc == "Extra")
+glyc$glyc_ratio <- NA
+for (i in 1:nrow(glyc)){
+  print(i)
+  temp_protein <- glyc$Protein[i]
+  temp_position <- glyc$Position[i]
+  temp_protein_df <- subset(extra_proteins, Protein == temp_protein)
+  pos_1_m <- as.character(temp_protein_df$Residue[which((temp_protein_df$Position + 1) == temp_position)])
+  pos_2_m <- as.character(temp_protein_df$Residue[which((temp_protein_df$Position + 2) == temp_position)])
+  pos_1_a <- as.character(temp_protein_df$Residue[which((temp_protein_df$Position - 1) == temp_position)])
+  if ((length(pos_1_m) + length(pos_2_m) + length(pos_1_a)) != 3){
+    next
+  }
+  glyc_ratio <- -0.5070 + 3.9373*as.numeric(pos_1_a %in% c("G","Y","N","S","C","Q","T")) + 3.6061*as.numeric(pos_1_m %in% c("G","Y","N","S","C","Q","T")) + 3.0451*as.numeric(pos_1_m %in% c("C","M","S","T","A","V","I","L","G")) + 1.3292*as.numeric(!pos_2_m %in% c("H","R","K")) + 2.1615*as.numeric(pos_2_m %in% c("F","Y","W","C","M"))
+  glyc$glyc_ratio[i] <- glyc_ratio
+}
+aggregate(glyc_ratio ~ Side2, data=glyc, FUN="mean")
+glyc2 <- subset(master_df3_filtered, glyc == "Sequon" & loc == "Intra") 
+intra_proteins <- subset(master_df3_filtered, loc == "Intra")
+glyc2$glyc_ratio <- NA
+for (i in 1:nrow(glyc2)){
+  print(i)
+  temp_protein <- glyc2$Protein[i]
+  temp_position <- glyc2$Position[i]
+  temp_protein_df <- subset(intra_proteins, Protein == temp_protein)
+  pos_1_m <- as.character(temp_protein_df$Residue[which((temp_protein_df$Position + 1) == temp_position)])
+  pos_2_m <- as.character(temp_protein_df$Residue[which((temp_protein_df$Position + 2) == temp_position)])
+  pos_1_a <- as.character(temp_protein_df$Residue[which((temp_protein_df$Position - 1) == temp_position)])
+  if ((length(pos_1_m) + length(pos_2_m) + length(pos_1_a)) != 3){
+    next
+  }
+  glyc_ratio <- -0.5070 + 3.9373*as.numeric(pos_1_a %in% c("G","Y","N","S","C","Q","T")) + 3.6061*as.numeric(pos_1_m %in% c("G","Y","N","S","C","Q","T")) + 3.0451*as.numeric(pos_1_m %in% c("C","M","S","T","A","V","I","L","G")) + 1.3292*as.numeric(!pos_2_m %in% c("H","R","K")) + 2.1615*as.numeric(pos_2_m %in% c("F","Y","W","C","M"))
+  glyc2$glyc_ratio[i] <- glyc_ratio
+}
+aggregate(glyc_ratio ~ Side2, data=glyc2, FUN="mean")
+glyc_efficiency <- rbind(glyc,glyc2)
+save(glyc_efficiency, file = "Data/RData/Human/glyc_efficiency.RData")
+
+load("Data/RData/Human/glyc_efficiency.RData")
+glyc_efficiency$loc2 <- "No"
+glyc_efficiency$loc2[which(glyc_efficiency$glyc == "N-linked Glycosylation_N" & glyc_efficiency$Side2 %in% c("1_None", "2_N_ter","3_N_ter"))] <- "Glycosylated enriched position"
+glyc_efficiency$loc2[which(glyc_efficiency$glyc == "N-linked Glycosylation_N" & !glyc_efficiency$Side2 %in% c("1_None", "2_N_ter","3_N_ter"))] <- "Glycosylated not enriched position"
+glyc_efficiency$loc2[which(glyc_efficiency$glyc == "Sequon" )] <- "Non_glycosylated sequon"
+my_comparisons <- list(c("Glycosylated enriched position", "Glycosylated not enriched position"),c("Glycosylated enriched position", "Non_glycosylated sequon"),c("Non_glycosylated sequon", "Glycosylated not enriched position"))
+aggregate(glyc_ratio ~ loc2, data=glyc_efficiency, FUN="median")
+
+glyc_efficiency$last60 <- glyc_efficiency$protein_length - glyc_efficiency$Position 
+glyc_efficiency$where <- "No"
+glyc_efficiency$where[which(glyc_efficiency$Position < 70)] <- "First 60"
+glyc_efficiency$where[which(glyc_efficiency$last60 < 70)] <- "Last 60"
+aggregate(glyc_ratio ~ loc2 + where, data=glyc_efficiency, FUN="mean")
+
+
+p <- ggplot(glyc_efficiency, aes(y=glyc_ratio, x=as.factor(loc2))) + 
+  geom_boxplot(notch=TRUE,outlier.size=1) + theme_classic() + labs(y = "Conservation") + stat_compare_means(comparisons = my_comparisons) + theme(axis.text=element_text(size=11,colour = "black"), axis.title=element_text(size=11,colour = "black"))
+p
+t_test <- compare_means(glyc_ratio ~ loc2, comparisons = my_comparisons, p.adjust.method = "bonferroni", method='wilcox', data = glyc_efficiency)
+```
+
+Look at glycosylated sites that have been associated with diseases (SNPs). Compare glycosylated sites in EP vs glycosylated sites not in EP. Do not check again!
+
+```{r, include=FALSE}
+#Check how many GK residues are mutated in HUMSAVAR
+humasvar <- read.csv("~/Documents/PhD/Projects/PTM_project_final/Data/Other/humasvar.txt", header=FALSE)
+conn = textConnection(humasvar$V1)
+humasvar <- do.call(rbind, lapply(readLines(conn), function(u) strsplit(u,'\\s{2,}')[[1]]))
+humasvar <- as.data.frame(humasvar)
+humasvar <- subset(humasvar, V2 %in% master_df3_filtered$Protein, select = c(1:6))
+colnames(humasvar) <- c("name","Protein","FTID","AAchange","Type_variant","dbSNP") 
+matches <- regmatches(humasvar$AAchange, gregexpr("[[:digit:]]+", humasvar$AAchange))
+humasvar$Position <- as.numeric(unlist(matches))
+master_df3_filtered$glyc2 <- NA
+master_df3_filtered$glyc2[which(master_df3_filtered$Type2 == "N-linked Glycosylation_N")] <- "2"
+master_df3_filtered$glyc2[which(is.na(master_df3_filtered$glyc2))] <- as.character(master_df3_filtered$Residue[which(is.na(master_df3_filtered$glyc2))])
+all_res <- paste(master_df3_filtered$glyc2, collapse = '')
+all_res <- gsub('2[^P][ST]', '210', all_res)
+all_res <- unlist(strsplit(all_res,""))
+master_df3_filtered$glyc2 <- all_res
+humasvar2 <- merge(master_df3_filtered,humasvar, by = c("Protein","Position"))
+humasvar2$Type_variant <- as.factor(as.character(humasvar2$Type_variant))
+humasvar3 <- subset(humasvar2, glyc2 %in% c("0","2"))
+table(humasvar3$Side2,humasvar3$Type_variant)
+```
+
+GK effect. Calculate how many charged residues are in close proximity to APRs 
+
+```{r, include=FALSE}
+#Check how many GK residues are near N-linked enriched regions
+load("Data/RData/Human/tango_APRs.RData")
+onlygk_tango2 <- subset(master_df3_filtered, APRdef2_tango%in% c(1,2,3,4))
+GKS_3 <- subset(onlygk_tango2, glyc %in% c("Sequon","N-linked Glycosylation_N") & loc != "No")
+GKS_3$category <- paste0(GKS_3$APRdef_tango," ",GKS_3$Side)
+my_comparisons <- list(c("Sequon","N-linked Glycosylation_N"))
+GKS_3$category <- factor(GKS_3$category,
+                      levels = c('GK_3 N_ter','GK_2 N_ter','GK_1 N_ter','APR None','GK_1 C_ter','GK_2 C_ter','GK_3 C_ter'),ordered = TRUE)
+GKS_3$gks <- NA
+GKS_3$area <- NA
+for (i in 1:nrow(GKS_3)){
+  temp_prot <- as.character(GKS_3$Protein[i])
+  temp_apr <- GKS_3$APRcount_tango[i]
+  temp_apr <- subset(tango_APRs2, APRcount_tango == temp_apr)
+  temp_alignment <- subset(human_proteome, Protein == temp_prot)
+  temp_alignment$area <- substr(temp_alignment$Sequence, temp_apr$startAPR - 3, temp_apr$endAPR + 3)
+  list_names <- strsplit(as.character(temp_alignment$area), "")
+  res <- matrix(nrow = length(temp_alignment$area), ncol = 1)
+  for (k in 1:length(temp_alignment$area)){
+    res[k,] <- sum(list_names[[k]] %in%  c("D","E","K","R","P"))
+  }
+  temp_alignment$area_gks <- res
+  GKS_3$gks[i] <- temp_alignment$area_gks
+  GKS_3$area[i] <- temp_alignment$area
+}
+table(GKS_3$category,GKS_3$glyc)
+GKS_3 %>%
+  ggplot(aes(x = gks, y = category)) + theme_classic() +
+  geom_density_ridges(aes(fill = glyc),alpha=0.6,bandwidth=0.4,quantile_lines=TRUE,quantile_fun=function(x,...)mean(x)) +
+  scale_fill_npg() 
+
+GKS_4 <- subset(GKS_3, avgScore >= 50)
+table(GKS_4$category,GKS_4$glyc)
+table(GKS_4$category,GKS_4$glyc,GKS_4$gks)
+categories <- unique(GKS_4$category)
+ggplot(GKS_4, aes(x=gks, fill=glyc))+
+  geom_bar(aes(y = ..prop..),position = "dodge")+
+  facet_grid(cols = vars(category)) + theme_classic() + theme(axis.text=element_text(size=11,colour = "black"), axis.title=element_text(size=11,colour = "black"))
+
+GKS_3$len <- 1
+GKS_0 <- subset(GKS_3, avgScore >= 0 & avgScore < 25)
+GKS_25 <- subset(GKS_3, avgScore >= 25 & avgScore < 50)
+GKS_50 <- subset(GKS_3, avgScore >= 50 & avgScore < 75)
+GKS_75 <- subset(GKS_3, avgScore >= 75)
+
+aggregate (gks ~ glyc + category, data=GKS_0, FUN="mean")
+aggregate (gks ~ glyc + category, data=GKS_25, FUN="mean")
+aggregate (gks ~ glyc + category, data=GKS_50, FUN="mean")
+aggregate (gks ~ glyc + category, data=GKS_75, FUN="mean")
+
+aggregate (len ~ glyc + category, data=GKS_0, FUN="sum")
+aggregate (len ~ glyc + category, data=GKS_25, FUN="sum")
+aggregate (len ~ glyc + category, data=GKS_50, FUN="sum")
+aggregate (len ~ glyc + category, data=GKS_75, FUN="sum")
+
+for (i in 1:length(categories)){
+  GKS_3_temp <- subset(GKS_3, category == categories[i])
+  print(as.character(categories[i]))
+  print(compare_means(gks ~ glyc, data = GKS_3_temp))
+}
+for (i in 1:length(categories)){
+  GKS_4_temp <- subset(GKS_4, category == categories[i])
+  print(as.character(categories[i]))
+  print(compare_means(gks ~ glyc, data = GKS_4_temp))
+}
+```
+
+TANGO score
+
+```{r, include=FALSE}
+#Average tango and pure tango
+load("Data/RData/Human/tango_APRs.RData")
+onlygk_tango2 <- subset(master_df3_filtered, APRdef2_tango%in% c(1,2,3,4))
+GKS_3 <- subset(onlygk_tango2, glyc %in% c("Sequon","N-linked Glycosylation_N") & loc != "No")
+GKS_3$category <- paste0(GKS_3$APRdef_tango," ",GKS_3$Side)
+my_comparisons <- list(c("Sequon","N-linked Glycosylation_N"))
+GKS_3$category <- factor(GKS_3$category,
+                      levels = c('GK_3 N_ter','GK_2 N_ter','GK_1 N_ter','APR None','GK_1 C_ter','GK_2 C_ter','GK_3 C_ter'),ordered = TRUE)
+p <- ggplot(GKS_3, aes(y=Rel_acc, x=as.factor(glyc))) + 
+  geom_boxplot(notch=TRUE,outlier.size=1) + theme_classic() + labs(y = "Effect", x="PTM vs Non-PTM") +
+  stat_summary(fun.y=mean, geom="point", shape=20, size=3, color="red", fill="red") + stat_compare_means(comparisons = my_comparisons)
+p + facet_grid(. ~ category)
+p <- ggplot(GKS_3, aes(y=avgScore, x=as.factor(glyc))) + 
+  geom_boxplot(notch=TRUE,outlier.size=1) + theme_classic() + labs(y = "Aggregation propensity (Avg. TANGO score)", x="") +
+  stat_compare_means(comparisons = my_comparisons, method = "wilcox.test")
+p + facet_grid(. ~ category) + theme(axis.text=element_text(size=11,colour = "black"), axis.title=element_text(size=11,colour = "black"))
+p <- ggplot(GKS_3, aes(y=pure_Tango, x=as.factor(glyc))) + 
+  geom_boxplot(notch=TRUE,outlier.size=1) + theme_classic() + labs(y = "Effect", x="PTM vs Non-PTM") +
+  stat_summary(fun.y=mean, geom="point", shape=20, size=3, color="red", fill="red") + stat_compare_means(comparisons = my_comparisons)
+p + facet_grid(. ~ category)
+p <- ggplot(GKS_3, aes(y=APR_length, x=as.factor(glyc))) + 
+  geom_boxplot(notch=TRUE,outlier.size=1) + theme_classic() + labs(y = "Effect", x="PTM vs Non-PTM") +
+  stat_summary(fun.y=mean, geom="point", shape=20, size=3, color="red", fill="red") + stat_compare_means(comparisons = my_comparisons)
+p + facet_grid(. ~ category)
+GKS_3$total_pure_tango <- GKS_3$avgScore * GKS_3$APR_length
+p <- ggplot(GKS_3, aes(y=total_pure_tango, x=as.factor(glyc))) + 
+  geom_boxplot(notch=TRUE,outlier.size=1) + theme_classic() + labs(y = "Effect", x="PTM vs Non-PTM") +
+  stat_summary(fun.y=mean, geom="point", shape=20, size=3, color="red", fill="red") + stat_compare_means(comparisons = my_comparisons)
+p + facet_grid(. ~ category)
+
+GKS_3$Energy[which(GKS_3$Energy > 2.5)] <- 2.5
+p <- ggplot(GKS_3, aes(y=Energy, x=as.factor(glyc))) + 
+  geom_boxplot(notch=TRUE,outlier.size=1) + theme_classic() + labs(y = "Energy (Kcal/mol)", x="PTM vs Non-PTM") +
+  stat_summary(fun.y=mean, geom="point", shape=20, size=3, color="red", fill="red") + stat_compare_means(comparisons = my_comparisons)
+p + facet_grid(. ~ category)
+aggregate (Energy ~ glyc + category, data=GKS_3, FUN="mean")
+GKS_4 <- subset(GKS_3, ALPHA_SCORE > 70)
+p <- ggplot(GKS_4, aes(y=Energy, x=as.factor(glyc))) + 
+  geom_boxplot(notch=TRUE,outlier.size=1) + theme_classic() + labs(y = "Energy (Kcal/mol)", x="PTM vs Non-PTM") +
+  stat_summary(fun.y=mean, geom="point", shape=20, size=3, color="red", fill="red") + stat_compare_means(comparisons = my_comparisons)
+p + facet_grid(. ~ category)
+aggregate (Energy ~ glyc + category, data=GKS_4, FUN="mean")
+p <- ggplot(GKS_3, aes(y=MainChain.burial, x=as.factor(glyc))) + 
+  geom_boxplot(notch=TRUE,outlier.size=1) + theme_classic() + labs(y = "Fraction of main chain buried", x="PTM vs Non-PTM") +
+  stat_summary(fun.y=mean, geom="point", shape=20, size=3, color="red", fill="red") + stat_compare_means(comparisons = my_comparisons)
+p + facet_grid(. ~ category)
+aggregate (MainChain.burial ~ glyc + category, data=GKS_3, FUN="mean")
+p <- ggplot(GKS_3, aes(y=SideChain.burial, x=as.factor(glyc))) + 
+  geom_boxplot(notch=TRUE,outlier.size=1) + theme_classic() + labs(y = "Fraction of side chain buried", x="PTM vs Non-PTM") +
+  stat_summary(fun.y=mean, geom="point", shape=20, size=3, color="red", fill="red") + stat_compare_means(comparisons = my_comparisons)
+p + facet_grid(. ~ category)
+aggregate (SideChain.burial ~ glyc + category, data=GKS_3, FUN="mean")
+```
+
+STT3A vs STT3B
+
+```{r, include=FALSE}
+STT3A <- read.delim("~/Documents/PhD/Projects/PTM_project_final/Data/Human/Other/STT3A.txt")
+STT3B <- read.delim("~/Documents/PhD/Projects/PTM_project_final/Data/Human/Other/STT3B.txt")
+list_names <- strsplit(as.character(STT3A$Uniprot.ID), "\\.")
+res <- matrix(nrow = length(STT3A$Uniprot.ID), ncol = 1)
+for (i in 1:length(STT3A$Uniprot.ID)){
+  res[i,] <- list_names[[i]][1]
+}
+STT3A$Uniprot.ID <- res
+colnames(STT3A) <- c("Protein","Length","Sequon","Position","Mean","Std")
+list_names <- strsplit(as.character(STT3B$Uniprot.ID), "\\.")
+res <- matrix(nrow = length(STT3B$Uniprot.ID), ncol = 1)
+for (i in 1:length(STT3B$Uniprot.ID)){
+  res[i,] <- list_names[[i]][1]
+}
+STT3B$Uniprot.ID <- res
+colnames(STT3B) <- c("Protein","Length","Sequon","Position","Mean","Std")
+glyc_enriched <- subset(master_df3_filtered, Type2 == "N-linked Glycosylation_N" & Side2 %in% c("3_N_ter","2_N_ter","1_None"), select = c(1,2))
+glyc_enriched$enriched <- "Yes"
+glyc_enriched$Protein <- as.character(glyc_enriched$Protein)
+STT3A_en <- merge(STT3A, glyc_enriched, by = c("Protein","Position"), all.x = T)
+STT3B_en <- merge(STT3B, glyc_enriched, by = c("Protein","Position"), all.x = T)
+STT3A_en <- STT3A_en[order(STT3A_en$Mean),]
+STT3B_en <- STT3B_en[order(STT3B_en$Mean),]
+STT3A_en$id <- paste0(STT3A_en$Protein,"_",STT3A_en$Position)
+STT3B_en$id <- paste0(STT3B_en$Protein,"_",STT3B_en$Position)
+STT3A_rank <- subset(STT3A_en, select =  c(8,5))
+STT3B_rank <- subset(STT3B_en, select =  c(8,5))
+STT3A_rank <- setNames(STT3A_rank$Mean,as.character(STT3A_rank$id))
+STT3B_rank <- setNames(STT3B_rank$Mean,as.character(STT3B_rank$id))
+glyc_enriched <- paste0(glyc_enriched$Protein,"_",glyc_enriched$Position)
+set.seed(42)
+plotEnrichment(glyc_enriched,
+               STT3A_rank) + labs(title="STT3A")
+plotEnrichment(glyc_enriched,
+               STT3B_rank) + labs(title="STT3B")
+STT3A_en$type <- "STT3A"
+STT3B_en$type <- "STT3B"
+all_en <- rbind(STT3A_en,STT3B_en)
+all_en$enriched[which(is.na(all_en$enriched))] <- "No"
+all_en <- all_en[order(all_en$enriched),]
+ggplot(all_en, aes(type, Mean,enriched)) +
+  geom_boxplot(notch = T,outlier.shape = NA) +
+  geom_hline(yintercept=0.5,linetype="dashed", color = "black") +
+  geom_hline(yintercept=-0.5,linetype="dashed", color = "black") +
+  geom_point(alpha = 0.4, position = position_jitter(width = .2),aes(colour = factor(enriched))) +
+  scale_color_manual(values=c("black", "red")) +
+  theme_classic() + labs(y = "Δlog2 (mutant vs. wild type", x="") 
+all_en$len <- 1
+all_en$diff <- "No"
+all_en$diff[which(all_en$Mean < -1)] <- "Yes"
+aggregate (len ~ enriched + type + diff, data=all_en, FUN="sum")
+```
+
+STT3B sequons (based on last 50 res or NCT/S)
+
+```{r, include=FALSE}
+master_df3_filtered$last50 <- "No"
+master_df3_filtered$last50[which(master_df3_filtered$protein_length - master_df3_filtered$Position < 55)] <- "Yes"
+table(master_df3_filtered$glyc,master_df3_filtered$last50)
+master_df3_filtered$stt3b <- "No"
+master_df3_filtered$stt3b[which( master_df3_filtered$last50 == "Yes")] <- "Yes"
+table(master_df3_filtered$glyc,master_df3_filtered$stt3b)
+glyc_sites <- subset(master_df3_filtered, glyc == "N-linked Glycosylation_N")
+table(glyc_sites$last50,glyc_sites$APRdef_tango, glyc_sites$Side)
+#Look at cysteines position X that make disulfide bridges
+load("Data/RData/Human/Disulfide_bridges2.RData")
+glyc_sites$cys_seq <- "No"
+glyc_sites$Position2 <- glyc_sites$Position + 1
+glyc_sites$cys_seq[which(paste0(glyc_sites$Protein,"_",glyc_sites$Position2) %in% c(paste0(Disulfide_bridges2$Protein,"_",Disulfide_bridges2$start), paste0(Disulfide_bridges2$Protein,"_",Disulfide_bridges2$start)))] <- "Yes"
+table(glyc_sites$glyc,glyc_sites$cys_seq)
+table(glyc_sites$cys_seq,glyc_sites$APRdef_tango, glyc_sites$Side)
+```
+
+Check whethere there are other protein families like Serpins
+
+```{r, include=FALSE}
+load("Data/RData/Human/tango_APRs.RData")
+families <- read.delim("~/Documents/PhD/Projects/PTM_project_final/Data/Human/Protein_families/uniprotkb_proteome_UP000005640_AND_revi_2023_11_14.tsv")
+families <- subset(families, select = c(1, 14))
+colnames(families) <- c("Protein","Family")
+loc <- unique(subset(master_df3_filtered, loc != "No", select = c(1,37,40)))
+loc <- merge(loc, families)
+loc2 <- subset(loc, loc2 == "Enriched position")
+a <- data.frame(table(loc2$Family))
+a <- subset(a, Freq > 2 & Freq < 100)
+```
+
+
+

@@ -1,0 +1,181 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+---
+title: "CamSol analysis"
+output: html_notebook
+---
+```{r, include=FALSE} 
+library(dplyr)
+library(ggplot2)
+library(rlist)
+library(tidyr)
+library(ggpubr)
+library(stringr)
+library(seqinr)
+library(IRanges)
+library(GenomicRanges)
+library(data.table)
+library(bio3d)
+```
+
+The human proteome was obtained from UniProtKB/Swiss-Prot database (reference proteome UP000005640; release 2022_02). CamSol was used to obtain an intrinsic solubility profile of proteins. Regions with scores larger than 1 denote highly soluble regions, while scores smaller than -1 poorly soluble ones.
+
+```{r, include=FALSE}
+load("Data/RData/Human/human_proteome.RData")
+CamSol_results <- read.delim("Data/Human/Other_predictors/CamSol_2.txt", header=TRUE)
+CamSol_results2 <- read.delim("Data/Human/Other_predictors/CamSol_1.txt", header=TRUE)
+CamSol_results <- rbind(CamSol_results,CamSol_results2)
+s <- strsplit(CamSol_results$intrinsic.solubility.profile, split = ";")
+CamSol_results <- data.frame(Protein = rep(CamSol_results$Name, sapply(s, length)), intrinsic.solubility.profile = unlist(s))
+CamSol_proteins <- subset(human_proteome, Protein %in% CamSol_results$Protein)
+s2 <- strsplit(CamSol_proteins$Sequence, split = "")
+fun <- function(x) {
+    i <- seq(1,x,1)
+}
+length_prots <- sapply(s2, length)
+master_df <- data.frame(Protein = rep(CamSol_proteins$Protein, sapply(s2, length)), Residue = unlist(s2), Position = unlist(sapply(length_prots, fun)))
+master_df$intrinsic.solubility.profile <- CamSol_results$intrinsic.solubility.profile
+```
+
+Signal peptides and transmembrane domains were identified using deepTMHMM. These were later removed from the analyses to avoid biases.
+
+```{r, include=FALSE}
+#Transmembrane domains from TMHMM (deepTMHMM using biolib webserver)
+trans1.5000 <- read.table("Data/Human/TMHMM/TMRs_1-5000.gff3", sep=";", quote="\"")
+trans5001.10000 <- read.table("Data/Human/TMHMM/TMRs_5001-10000.gff3", sep=";", quote="\"")
+trans10001.15000 <- read.table("Data/Human/TMHMM/TMRs_10001-15000.gff3", sep=";", quote="\"")
+transend <- read.table("Data/Human/TMHMM/TMRs_15001-end.gff3", sep=";", quote="\"")
+TMHMM <- rbind(trans1.5000,trans5001.10000,trans10001.15000,transend)
+TMHMM <- subset(TMHMM, V1 != "//")
+TMHMM <- cbind(TMHMM, read.table(text = TMHMM$V1, header = FALSE, sep = "\t"))
+TMHMM <- subset(TMHMM, select = c(2:5))
+colnames(TMHMM) <- c("Protein","Topology","Start","End")
+TMHMM <- subset(TMHMM, Protein %in% human_proteome$Protein)
+dt1 <- as.data.table(TMHMM)
+dt2 <- as.data.table(master_df)
+gr1 = GRanges(Rle(dt1$Protein), IRanges(as.numeric(dt1$Start), as.numeric(dt1$End)))
+gr2 = GRanges(Rle(dt2$Protein), IRanges(as.numeric(dt2$Position),as.numeric(dt2$Position)))
+zone.ind <- findOverlaps(gr2, gr1, select="arbitrary")
+dt2$Topology <- dt1$Topology[zone.ind]
+master_df <- as.data.frame(dt2)
+rm(dt2,dt1)
+gc()
+save(master_df, file = "Data/RData/Human/all_CamSol_filtered.RData")
+```
+
+In this study, CamSol APRs are defined as continuous segments between 5 and 15 amino acids in length, each with a intrinsic solubility score lower than -1. Gatekeeper positions (GKPs) are defined as the next three residues immediately downstream and upstream of APRs. All other residues are defined as distal regions. 
+
+```{r, include=FALSE}
+#Annotate CamSol categories and add CamSol per APR
+load("Data/RData/Human/all_CamSol_filtered.RData")
+master_df$intrinsic.solubility.profile <- as.numeric(master_df$intrinsic.solubility.profile)
+master_df$APRdef_camsol <- "No"
+master_df$APRdef_camsol[which(master_df$intrinsic.solubility.profile < -1)] <- "APR" 
+annotateDF <- function(prepare_annotation, a,b,c,d) {
+  prepare_annotation$APRdef2_camsol <- gsub(a, b, prepare_annotation$APRdef2_camsol)
+  prepare_annotation$APRdef2_camsol <- gsub(c, d, prepare_annotation$APRdef2_camsol)
+  return(prepare_annotation)
+}
+master_df3 <- master_df
+master_df3$APRdef2_camsol <-as.numeric(as.factor(master_df3$APRdef_camsol))
+master_df3$APRdef2_camsol[which(master_df3$APRdef2_camsol == 2)] <- 0
+prepare_annotation <- aggregate (APRdef2_camsol ~ Protein, data=master_df3, FUN="paste",collapse = "")
+prepare_annotation2 <- annotateDF(prepare_annotation,"01","21","10","12") #GK_1
+prepare_annotation2 <- annotateDF(prepare_annotation2,"02","32","20","23") #GK_2
+prepare_annotation2 <- annotateDF(prepare_annotation2,"03","43","30","34") #GK_3
+prepare_annotation2 <- paste(prepare_annotation2$APRdef2_camsol, collapse="")
+prepare_annotation2 <- unlist(strsplit(prepare_annotation2,""))
+master_df3$APRdef2_camsol <- prepare_annotation2
+master_df3$APRdef_camsol[which(master_df3$APRdef2_camsol == "0")] <- "Distal region"
+master_df3$APRdef_camsol[which(master_df3$APRdef2_camsol == "2")] <- "GK_1"
+master_df3$APRdef_camsol[which(master_df3$APRdef2_camsol == "3")] <- "GK_2"
+master_df3$APRdef_camsol[which(master_df3$APRdef2_camsol == "4")] <- "GK_3"
+master_df3$Protein <- as.factor(master_df3$Protein)
+prepare_annotation3 <- annotateDF(prepare_annotation,"01","A1","10","1D") #GK_1
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0A","BA","D0","DE") #GK_2
+prepare_annotation3 <- annotateDF(prepare_annotation3,"0B","CB","E0","EF") #GK_3
+prepare_annotation3 <- paste(prepare_annotation3$APRdef2_camsol, collapse="")
+prepare_annotation3 <- unlist(strsplit(prepare_annotation3,""))
+master_df3$Side <- prepare_annotation3
+master_df3$Side[which(master_df3$Side %in% c("0","1"))] <- "None"
+master_df3$Side[which(master_df3$Side %in% c("A","B","C"))] <- "N_ter"
+master_df3$Side[which(master_df3$Side %in% c("D","E","F"))] <- "C_ter"
+#Define Camsol APRs ids
+camsol_APRs <- subset(master_df3, APRdef_camsol != "Distal region")
+j <- 1
+camsol_APRs$APRcount_camsol <- 0
+camsol_APRs$APRcount_camsol[1] <- 1
+for (i in 2:length(camsol_APRs$Protein)){
+  if (i %% 10000 == 0){
+    print(i)
+  }
+  if (camsol_APRs$Protein[i] != camsol_APRs$Protein[i-1] | camsol_APRs$Position[i] != (camsol_APRs$Position[i-1]+1)){
+    j <- j + 1
+    camsol_APRs$APRcount_camsol[i] <- j 
+  }
+  else if (camsol_APRs$Side[i-1] == "C_ter" & camsol_APRs$APRdef2_camsol[i-1] == 4) {
+    j <- j + 1
+    camsol_APRs$APRcount_camsol[i] <- j 
+  }
+  else if (camsol_APRs$Side[i-1] == "C_ter" & camsol_APRs$APRdef2_camsol[i-1] != 4 & camsol_APRs$Side[i] != "C_ter") {
+    j <- j + 1
+    camsol_APRs$APRcount_camsol[i] <- j 
+  }
+  else{
+    camsol_APRs$APRcount_camsol[i] <- j 
+  }
+}
+camsol_APRs2 <- subset(camsol_APRs, select = c(1,3,9))
+master_df3 <- merge(master_df3,camsol_APRs2, by=c("Protein","Position"),all = TRUE)
+master_df3$APRcount_camsol[which(is.na(master_df3$APRcount_camsol))] <- 0
+master_df3$APRdef_camsol[which(master_df3$APRcount_camsol == 0)] <- "No"
+save(master_df3, file = "Data/RData/Human/all_CamSol_annotated.RData")
+```
+
+
+
+```{r, include=FALSE}
+#Summarize CamSol information
+load("Data/RData/Human/all_CamSol_annotated.RData")
+master_df3$length <- 1
+onlyapr_camsol <- subset(master_df3, master_df3$APRdef_camsol=="APR")
+camsol_APRs <- aggregate (Residue ~ APRcount_camsol, data=onlyapr_camsol, FUN="paste",collapse = "")
+colnames(camsol_APRs) <- c("APRcount_camsol","APR")
+Totalcamsol <- aggregate (intrinsic.solubility.profile ~ APRcount_camsol, data=onlyapr_camsol, FUN="sum")
+colnames(Totalcamsol) <- c("APRcount_camsol","Totalcamsol")
+lengthAPR <- aggregate (length ~ APRcount_camsol, data=onlyapr_camsol, FUN="sum")
+colnames(lengthAPR) <- c("APRcount_camsol","lengthAPR")
+startAPR <- aggregate (Position ~ APRcount_camsol, data=onlyapr_camsol, FUN="min")
+colnames(startAPR) <- c("APRcount_camsol","startAPR")
+endAPR <- aggregate (Position ~ APRcount_camsol, data=onlyapr_camsol, FUN="max")
+colnames(endAPR) <- c("APRcount_camsol","endAPR")
+proteins_apr <- unique(subset(onlyapr_camsol, select = c(1,9)))
+topology_apr <- aggregate (Topology ~ APRcount_camsol, data=onlyapr_camsol, FUN="unique")
+camsol_APRs <- Reduce(function(x, y) merge(x, y, all=TRUE), list(proteins_apr,camsol_APRs,Totalcamsol,lengthAPR,startAPR,endAPR,topology_apr))
+camsol_APRs$avg.camsol <- camsol_APRs$Totalcamsol / camsol_APRs$lengthAPR
+camsol_APRs2 <- subset(camsol_APRs, lengthAPR > 4 & lengthAPR < 16 & Topology %in% c("outside","inside")) #From 117144 to 85126
+onlyapr_camsol <- onlyapr_camsol[which(onlyapr_camsol$APRcount_camsol %in% camsol_APRs2$APRcount_camsol),]
+len_APR <- aggregate (length ~ APRcount_camsol, data=onlyapr_camsol, FUN="sum")
+colnames(len_APR)[2] <- "APR_length"
+onlyapr_camsol$length <- NULL
+onlyapr_camsol <- merge(onlyapr_camsol,len_APR)
+master_df3$APRcount_camsol[which(!master_df3$APRcount_camsol %in% onlyapr_camsol$APRcount_camsol)] <- 0
+master_df3$APRdef_camsol[which(master_df3$APRcount_camsol == 0)] <- "Distal region"
+master_df3$APRdef2_camsol[which(master_df3$APRcount_camsol == 0)] <- 0
+master_df3$Side[which(master_df3$APRcount_camsol == 0)] <- "None"
+total_scoreAPR <- aggregate (intrinsic.solubility.profile ~ APRcount_camsol, data=onlyapr_camsol, sum)
+colnames(total_scoreAPR) <- c("APRcount_camsol","TotalScore")
+onlyapr_camsol <- merge(onlyapr_camsol,total_scoreAPR,by="APRcount_camsol")
+onlyapr_camsol$avgScore <- onlyapr_camsol$TotalScore / onlyapr_camsol$APR_length
+temp <- unique(subset(onlyapr_camsol, select = c(1,2,11,12)))
+master_df3 <- merge(master_df3,temp,by = c("Protein","APRcount_camsol"), all.x = TRUE)
+master_df3 <- master_df3[order(master_df3$Protein, master_df3$Position),]
+rownames(master_df3) <- NULL
+master_df3$avgScore[which(is.na(master_df3$avgScore))] <- 0
+save(master_df3, file = "Data/RData/Human/master_df_camsol.RData")
+save(camsol_APRs2, file = "Data/RData/Human/camsol_APRs.RData")
+```
+
